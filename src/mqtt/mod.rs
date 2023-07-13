@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 ///
 /// # Neolink MQTT
 ///
@@ -9,11 +10,14 @@
 ///
 /// Control messages:
 ///
+/// - `/control/floodlight [on|off]` Turns floodlight (if equipped) on/off
 /// - `/control/led [on|off]` Turns status LED on/off
 /// - `/control/pir [on|off]` Turns PIR on/off
 /// - `/control/ir [on|off|auto]` Turn IR lights on/off or automatically via light detection
 /// - `/control/reboot` Reboot the camera
 /// - `/control/ptz` [up|down|left|right|in|out] (amount) Control the PTZ movements, amount defaults to 32.0
+/// - `/control/ptz/preset` [id] Move the camera to a known preset
+/// - `/control/ptz/assign` [id] [name] Assign the current ptz position to an ID and name
 ///
 /// Status Messages:
 ///
@@ -21,11 +25,13 @@
 /// `/status disconnected` Sent when the camera goes offline
 /// `/status/battery` Sent in reply to a `/query/battery`
 /// `/status/pir` Sent in reply to a `/query/pir`
+/// `/status/ptz/preset` Sent in reply to a `/query/ptz/preset`
 ///
 /// Query Messages:
 ///
 /// `/query/battery` Request that the camera reports its battery level
 /// `/query/pir` Request that the camera reports its pir status
+/// `/query/ptz/preset` Request that the camera reports the PTZ presets
 ///
 ///
 /// # Usage
@@ -56,18 +62,21 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 mod cmdline;
+mod discovery;
 mod event_cam;
 mod mqttc;
 
 use crate::config::{CameraConfig, Config, MqttConfig};
 use anyhow::{anyhow, Context, Error, Result};
 pub(crate) use cmdline::Opt;
+pub(crate) use discovery::Discoveries;
 use event_cam::EventCam;
 pub(crate) use event_cam::{Direction, Messages};
 use log::*;
 use mqttc::{Mqtt, MqttReplyRef};
 
 use self::{
+    discovery::enable_discovery,
     event_cam::EventCamSender,
     mqttc::{MqttReply, MqttSender},
 };
@@ -131,7 +140,8 @@ async fn listen_on_camera(cam_config: Arc<CameraConfig>, mqtt_config: &MqttConfi
         tokio::select! {
             v  = async {
                 // Normal poll operations
-                while let Ok(msg) = mqtt.poll().await {
+                loop {
+                    let msg = mqtt.poll().await?;
                     tokio::task::yield_now().await;
                     // Put the reply  on it's own async thread so we can safely sleep
                     // and wait for it to reply in it's own time
@@ -148,7 +158,6 @@ async fn listen_on_camera(cam_config: Arc<CameraConfig>, mqtt_config: &MqttConfi
                         }
                     });
                 }
-                Ok(())
             } => v,
             // Wait on any error from any of the error channels and if we get it we abort
             v = error_recv.recv() => v.map(Err).unwrap_or_else(|| Err(anyhow!("Listen on camera error channel closed"))),
@@ -166,6 +175,32 @@ async fn listen_on_camera(cam_config: Arc<CameraConfig>, mqtt_config: &MqttConfi
                         .with_context(|| {
                             format!("Failed to post connect over MQTT for {}", camera_name)
                         })?;
+
+                    if let Some(discovery_config) = &mqtt_config.discovery {
+                        enable_discovery(discovery_config, &mqtt_sender_cam, &cam_config).await?;
+                    }
+                }
+                Messages::FloodlightOn => {
+                    mqtt_sender_cam
+                        .send_message("status/floodlight", "on", true)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to publish floodlight on over MQTT for {}",
+                                camera_name
+                            )
+                        })?;
+                }
+                Messages::FloodlightOff => {
+                    mqtt_sender_cam
+                        .send_message("status/floodlight", "off", true)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to publish floodlight off over MQTT for {}",
+                                camera_name
+                            )
+                        })?;
                 }
                 Messages::MotionStop => {
                     mqtt_sender_cam
@@ -181,6 +216,25 @@ async fn listen_on_camera(cam_config: Arc<CameraConfig>, mqtt_config: &MqttConfi
                         .await
                         .with_context(|| {
                             format!("Failed to publish motion start for {}", camera_name)
+                        })?;
+                }
+                Messages::Snap(data) => {
+                    mqtt_sender_cam
+                        .send_message("status/preview", BASE64.encode(data).as_str(), true)
+                        .await
+                        .with_context(|| {
+                            format!("Failed to publish preview over MQTT for {}", camera_name)
+                        })?;
+                }
+                Messages::BatteryLevel(data) => {
+                    mqtt_sender_cam
+                        .send_message("status/battery_level", format!("{}", data).as_str(), true)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to publish battery level over MQTT for {}",
+                                camera_name
+                            )
                         })?;
                 }
                 _ => {}
@@ -213,6 +267,28 @@ async fn handle_mqtt_message(
             message: "FAIL",
         } => {
             // Do nothing for the success/fail replies
+        }
+        MqttReplyRef {
+            topic: "control/floodlight",
+            message: "on",
+        } => {
+            reply = Some(
+                event_cam_sender
+                    .send_message_with_reply(Messages::FloodlightOn)
+                    .await
+                    .with_context(|| "Failed to set camera status light on")?,
+            );
+        }
+        MqttReplyRef {
+            topic: "control/floodlight",
+            message: "off",
+        } => {
+            reply = Some(
+                event_cam_sender
+                    .send_message_with_reply(Messages::FloodlightOff)
+                    .await
+                    .with_context(|| "Failed to set camera status light off")?,
+            );
         }
         MqttReplyRef {
             topic: "control/led",
@@ -288,9 +364,10 @@ async fn handle_mqtt_message(
             let mut words = lowercase_message.split_whitespace();
             if let Some(direction_txt) = words.next() {
                 // Target amount to move
+                let speed = 32f32;
                 let amount = words.next().unwrap_or("32.0");
                 if let Ok(amount) = amount.parse::<f32>() {
-                    let seconds = amount / 32f32;
+                    let seconds = amount / speed;
                     // range checking on seconds so that you can't sleep for 3.4E+38 seconds
                     match seconds {
                         x if (0.0..10.0).contains(&x) => seconds,
@@ -301,12 +378,12 @@ async fn handle_mqtt_message(
                     };
 
                     let direction = match direction_txt {
-                        "up" => Direction::Up(amount, seconds),
-                        "down" => Direction::Down(amount, seconds),
-                        "left" => Direction::Left(amount, seconds),
-                        "right" => Direction::Right(amount, seconds),
-                        "in" => Direction::In(amount, seconds),
-                        "out" => Direction::Out(amount, seconds),
+                        "up" => Direction::Up(speed, seconds),
+                        "down" => Direction::Down(speed, seconds),
+                        "left" => Direction::Left(speed, seconds),
+                        "right" => Direction::Right(speed, seconds),
+                        "in" => Direction::In(speed, seconds),
+                        "out" => Direction::Out(speed, seconds),
                         _ => {
                             error!("Unrecognized PTZ direction \"{}\"", direction_txt);
                             return Ok(());
@@ -323,6 +400,42 @@ async fn handle_mqtt_message(
                 }
             } else {
                 error!("No PTZ Direction given. Please add up/down/left/right/in/out");
+            }
+        }
+        MqttReplyRef {
+            topic: "control/ptz/preset",
+            message,
+        } => {
+            if let Ok(id) = message.parse::<u8>() {
+                reply = Some(
+                    event_cam_sender
+                        .send_message_with_reply(Messages::Preset(id))
+                        .await
+                        .with_context(|| "Failed to send PTZ preset")?,
+                );
+            } else {
+                error!("PTZ preset was not a valid number");
+            }
+        }
+        MqttReplyRef {
+            topic: "control/ptz/assign",
+            message,
+        } => {
+            let mut words = message.split_whitespace();
+            let id = words.next();
+            let name = words.next();
+
+            if let (Some(Ok(id)), Some(name)) = (id.map(|id| id.parse::<u8>()), name) {
+                reply = Some(
+                    event_cam_sender
+                        .send_message_with_reply(Messages::PresetAssign(id, name.to_owned()))
+                        .await
+                        .with_context(|| "Failed to send PTZ preset assign")?,
+                );
+            } else if let (Some(Err(_)), _) = (id.map(|id| id.parse::<u8>()), name) {
+                error!("PTZ preset was not a valid number");
+            } else if let (_, None) = (id.map(|id| id.parse::<u8>()), name) {
+                error!("PTZ preset was not given a name");
             }
         }
         MqttReplyRef {
@@ -369,6 +482,18 @@ async fn handle_mqtt_message(
                     .with_context(|| "Failed to get pir status")?,
             );
             reply_topic = Some("status/pir");
+        }
+        MqttReplyRef {
+            topic: "query/ptz/preset",
+            ..
+        } => {
+            reply = Some(
+                event_cam_sender
+                    .send_message_with_reply(Messages::PresetQuery)
+                    .await
+                    .with_context(|| "Failed to get prz preset status")?,
+            );
+            reply_topic = Some("status/ptz/preset");
         }
         _ => {}
     }

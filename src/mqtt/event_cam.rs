@@ -1,6 +1,7 @@
 use crate::config::CameraConfig;
 use crate::utils::AddressOrUid;
 use anyhow::{anyhow, Context, Result};
+use futures::stream::StreamExt;
 use log::*;
 use neolink_core::bc_protocol::{
     BcCamera, Direction as BcDirection, Error as BcError, LightState, MaxEncryption, MotionStatus,
@@ -9,17 +10,17 @@ use std::sync::Arc;
 use tokio::{
     sync::mpsc::{channel, Receiver, Sender},
     task::JoinSet,
-    time::sleep,
+    time::{interval, sleep, Duration},
 };
 
-use core::time::Duration;
-
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) enum Messages {
     Login,
     MotionStop,
     MotionStart,
     Reboot,
+    FloodlightOn,
+    FloodlightOff,
     StatusLedOn,
     StatusLedOff,
     IRLedOn,
@@ -30,6 +31,11 @@ pub(crate) enum Messages {
     PIROff,
     PIRQuery,
     Ptz(Direction),
+    Snap(Vec<u8>),
+    BatteryLevel(u32),
+    Preset(u8),
+    PresetAssign(u8, String),
+    PresetQuery,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -203,6 +209,25 @@ impl EventCamThread {
             camera: arc_cam.clone(),
         };
 
+        let mut flight_thread = FloodlightThread {
+            tx: self.tx.clone(),
+            camera: arc_cam.clone(),
+        };
+
+        let mut snap_thread = SnapThread {
+            tx: self.tx.clone(),
+            camera: arc_cam.clone(),
+        };
+
+        let mut battery_thread = BatteryLevelThread {
+            tx: self.tx.clone(),
+            camera: arc_cam.clone(),
+        };
+
+        let mut keepalive_thread = KeepaliveThread {
+            camera: arc_cam.clone(),
+        };
+
         let mut message_handler = MessageHandler {
             rx: &mut self.rx,
             camera: arc_cam,
@@ -212,12 +237,60 @@ impl EventCamThread {
             val = async {
                 info!("{}: Listening to Camera Motion", camera_config.name);
                 motion_thread.run().await
-            } => {
+            }, if camera_config.mqtt.as_ref().expect("Should have an mqtt config at this point").enable_motion => {
                 if let Err(e) = val {
                     error!("Motion thread aborted: {:?}", e);
                     Err(e)
                 } else {
                     debug!("Normal finish on motion thread");
+                    Ok(())
+                }
+            },
+            val = async {
+                debug!("{}: Starting Pings", camera_config.name);
+                keepalive_thread.run().await
+            }, if camera_config.mqtt.as_ref().expect("Should have an mqtt config at this point").enable_pings => {
+                if let Err(e) = val {
+                    debug!("Ping thread aborted: {:?}", e);
+                    Err(e)
+                } else {
+                    debug!("Normal finish on Ping thread");
+                    Ok(())
+                }
+            },
+            val = async {
+                info!("{}: Listening to FloodLight Status", camera_config.name);
+                flight_thread.run().await
+            }, if camera_config.mqtt.as_ref().expect("Should have an mqtt config at this point").enable_light => {
+                if let Err(e) = val {
+                    error!("FloodLight thread aborted: {:?}", e);
+                    Err(e)
+                } else {
+                    debug!("Normal finish on FloodLight thread");
+                    Ok(())
+                }
+            },
+            val = async {
+                info!("{}: Updating Preview", camera_config.name);
+                snap_thread.run().await
+            }, if camera_config.mqtt.as_ref().expect("Should have an mqtt config at this point").enable_preview => {
+                if let Err(e) = val {
+                    error!("Snap thread aborted: {:?}", e);
+                    Err(e)
+                } else {
+                    debug!("Normal finish on Snap thread");
+                    Ok(())
+                }
+            },
+            val = async {
+                info!("{}: Updating Battery Level", camera_config.name);
+                battery_thread.run().await
+            }, if camera_config.mqtt.as_ref().expect("Should have an mqtt config at this point").enable_battery => {
+                if let Err(e) = val {
+                    error!("Battery thread aborted: {:?}", e);
+                    Err(e)
+                } else {
+                    debug!("Normal finish on Battery thread");
                     Ok(())
                 }
             },
@@ -272,6 +345,114 @@ impl MotionThread {
     }
 }
 
+struct FloodlightThread {
+    tx: Sender<Messages>,
+    camera: Arc<BcCamera>,
+}
+
+impl FloodlightThread {
+    async fn run(&mut self) -> Result<()> {
+        let mut reciever =
+            tokio_stream::wrappers::ReceiverStream::new(self.camera.listen_on_flightlight().await?);
+        while let Some(flights) = reciever.next().await {
+            for flight in flights.floodlight_status_list.iter() {
+                if flight.status == 0 {
+                    self.tx.send(Messages::FloodlightOff).await?;
+                } else {
+                    self.tx.send(Messages::FloodlightOn).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct SnapThread {
+    tx: Sender<Messages>,
+    camera: Arc<BcCamera>,
+}
+
+impl SnapThread {
+    async fn run(&mut self) -> Result<()> {
+        let mut tries = 0;
+        let base_duration = Duration::from_millis(500);
+        loop {
+            tokio::time::sleep(base_duration.saturating_mul(tries)).await;
+            let snapshot = match self.camera.get_snapshot().await {
+                Ok(info) => {
+                    tries = 1;
+                    info
+                }
+                Err(neolink_core::Error::UnintelligibleReply { reply, why }) => {
+                    log::debug!("Reply: {:?}, why: {:?}", reply, why);
+                    // Try again later
+                    tries += 1;
+                    continue;
+                }
+                Err(neolink_core::Error::CameraServiceUnavaliable) => {
+                    log::debug!("Snap not supported");
+                    futures::future::pending().await
+                }
+                Err(e) => return Err(e.into()),
+            };
+            self.tx.send(Messages::Snap(snapshot)).await?;
+        }
+    }
+}
+
+struct BatteryLevelThread {
+    tx: Sender<Messages>,
+    camera: Arc<BcCamera>,
+}
+
+impl BatteryLevelThread {
+    async fn run(&mut self) -> Result<()> {
+        let mut tries = 0;
+        let base_duration = Duration::from_secs(15);
+        loop {
+            tokio::time::sleep(base_duration.saturating_mul(tries)).await;
+            let battery = match self.camera.battery_info().await {
+                Ok(info) => {
+                    tries = 1;
+                    info
+                }
+                Err(neolink_core::Error::UnintelligibleReply { .. }) => {
+                    // Try again later
+                    tries += 1;
+                    continue;
+                }
+                Err(neolink_core::Error::CameraServiceUnavaliable) => {
+                    log::debug!("Battery not supported");
+                    futures::future::pending().await
+                }
+                Err(e) => return Err(e.into()),
+            };
+            self.tx
+                .send(Messages::BatteryLevel(battery.battery_percent))
+                .await?;
+        }
+    }
+}
+
+struct KeepaliveThread {
+    camera: Arc<BcCamera>,
+}
+
+impl KeepaliveThread {
+    async fn run(&mut self) -> Result<()> {
+        let mut interval =
+            tokio_stream::wrappers::IntervalStream::new(interval(Duration::from_secs(5)));
+        while let Some(_update) = interval.next().await {
+            if self.camera.ping().await.is_err() {
+                break;
+            }
+        }
+
+        futures::pending!(); // Never actually finish, has to be aborted
+        Ok(())
+    }
+}
+
 struct MessageHandler<'a> {
     rx: &'a mut Receiver<ToCamera>,
     camera: Arc<BcCamera>,
@@ -292,6 +473,30 @@ impl<'a> MessageHandler<'a> {
                         Messages::Reboot => {
                             if let Err(e) = self.camera.reboot().await {
                                 error = Some(format!("Failed to reboot the camera: {:?}", e));
+                                "FAIL".to_string()
+                            } else {
+                                "OK".to_string()
+                            }
+                        }
+                        Messages::FloodlightOn => {
+                            let res = self.camera.set_floodlight_manual(true, 180).await;
+                            if res.is_err() {
+                                error = Some(format!(
+                                    "Failed to turn on the floodlight light: {:?}",
+                                    res.err()
+                                ));
+                                "FAIL".to_string()
+                            } else {
+                                "OK".to_string()
+                            }
+                        }
+                        Messages::FloodlightOff => {
+                            let res = self.camera.set_floodlight_manual(false, 180).await;
+                            if res.is_err() {
+                                error = Some(format!(
+                                    "Failed to turn off the floodlight light: {:?}",
+                                    res.err()
+                                ));
                                 "FAIL".to_string()
                             } else {
                                 "OK".to_string()
@@ -411,27 +616,23 @@ impl<'a> MessageHandler<'a> {
                             }
                         }
                         Messages::Ptz(direction) => {
-                            let (bc_direction, amount, seconds) = match direction {
-                                Direction::Up(amount, seconds) => {
-                                    (BcDirection::Up, amount, seconds)
+                            let (bc_direction, speed, seconds) = match direction {
+                                Direction::Up(speed, seconds) => (BcDirection::Up, speed, seconds),
+                                Direction::Down(speed, seconds) => {
+                                    (BcDirection::Down, speed, seconds)
                                 }
-                                Direction::Down(amount, seconds) => {
-                                    (BcDirection::Down, amount, seconds)
+                                Direction::Left(speed, seconds) => {
+                                    (BcDirection::Left, speed, seconds)
                                 }
-                                Direction::Left(amount, seconds) => {
-                                    (BcDirection::Left, amount, seconds)
+                                Direction::Right(speed, seconds) => {
+                                    (BcDirection::Right, speed, seconds)
                                 }
-                                Direction::Right(amount, seconds) => {
-                                    (BcDirection::Right, amount, seconds)
-                                }
-                                Direction::In(amount, seconds) => {
-                                    (BcDirection::In, amount, seconds)
-                                }
-                                Direction::Out(amount, seconds) => {
-                                    (BcDirection::Out, amount, seconds)
+                                Direction::In(speed, seconds) => (BcDirection::In, speed, seconds),
+                                Direction::Out(speed, seconds) => {
+                                    (BcDirection::Out, speed, seconds)
                                 }
                             };
-                            if let Err(e) = self.camera.send_ptz(bc_direction, amount).await {
+                            if let Err(e) = self.camera.send_ptz(bc_direction, speed).await {
                                 error = Some(format!("Failed to send PTZ: {:?}", e));
                                 "FAIL".to_string()
                             } else {
@@ -439,9 +640,7 @@ impl<'a> MessageHandler<'a> {
                                 sleep(Duration::from_secs_f32(seconds)).await;
 
                                 // note that amount is not used in the stop command
-                                if let Err(e) =
-                                    self.camera.send_ptz(BcDirection::Stop, amount).await
-                                {
+                                if let Err(e) = self.camera.send_ptz(BcDirection::Stop, 0.0).await {
                                     error = Some(format!("Failed to send PTZ: {:?}", e));
                                     "FAIL".to_string()
                                 } else {
@@ -449,6 +648,48 @@ impl<'a> MessageHandler<'a> {
                                 }
                             }
                         }
+                        Messages::Preset(id) => {
+                            if let Err(e) = self.camera.moveto_ptz_preset(id).await {
+                                error = Some(format!("Failed to send PTZ preset: {:?}", e));
+                                "FAIL".to_string()
+                            } else {
+                                "OK".to_string()
+                            }
+                        }
+                        Messages::PresetAssign(id, name) => {
+                            if let Err(e) = self.camera.set_ptz_preset(id, name).await {
+                                error = Some(format!("Failed to send PTZ preset: {:?}", e));
+                                "FAIL".to_string()
+                            } else {
+                                "OK".to_string()
+                            }
+                        }
+                        Messages::PresetQuery => match self.camera.get_ptz_preset().await {
+                            Err(e) => {
+                                error!("Failed to get PTZ preset status: {:?}", e);
+                                "FAIL".to_string()
+                            }
+                            Ok(ptz_info) => {
+                                let bytes_res = yaserde::ser::serialize_with_writer(
+                                    &ptz_info,
+                                    vec![],
+                                    &Default::default(),
+                                );
+                                match bytes_res {
+                                    Ok(bytes) => match String::from_utf8(bytes) {
+                                        Ok(str) => str,
+                                        Err(_) => {
+                                            error!("Failed to encode PTZ preset status");
+                                            "FAIL".to_string()
+                                        }
+                                    },
+                                    Err(_) => {
+                                        error!("Failed to serialise PTZ preset status");
+                                        "FAIL".to_string()
+                                    }
+                                }
+                            }
+                        },
                         _ => "UNKNOWN COMMAND".to_string(),
                     };
                     if let Some(replier) = replier {

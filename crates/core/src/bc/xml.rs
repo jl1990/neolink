@@ -76,6 +76,15 @@ pub struct BcXml {
     /// Sent to move the camera
     #[yaserde(rename = "PtzControl")]
     pub ptz_control: Option<PtzControl>,
+    /// Sent to manually control the floodlight
+    #[yaserde(rename = "FloodlightManual")]
+    pub floodlight_manual: Option<FloodlightManual>,
+    /// Received when the floodlight status is updated
+    #[yaserde(rename = "FloodlightStatusList")]
+    pub floodlight_status_list: Option<FloodlightStatusList>,
+    /// Sent or received for the PTZ preset functionality
+    #[yaserde(rename = "PtzPreset")]
+    pub ptz_preset: Option<PtzPreset>,
     /// Recieved on login/low battery events
     #[yaserde(rename = "BatteryList")]
     pub battery_list: Option<BatteryList>,
@@ -88,6 +97,12 @@ pub struct BcXml {
     /// Recieved on request for a users persmissions/capabilitoes
     #[yaserde(rename = "PushInfo")]
     pub push_info: Option<PushInfo>,
+    /// Recieved on request for a link type
+    #[yaserde(rename = "LinkType")]
+    pub link_type: Option<LinkType>,
+    /// Recieved AND send for the snap message
+    #[yaserde(rename = "Snap")]
+    pub snap: Option<Snap>,
 }
 
 impl BcXml {
@@ -328,6 +343,42 @@ pub struct LedState {
     pub light_state: String,
 }
 
+/// FloodlightStatus xml
+#[derive(PartialEq, Eq, Default, Debug, YaDeserialize, YaSerialize, Clone)]
+pub struct FloodlightStatus {
+    /// Channel ID of floodlight
+    #[yaserde(rename = "channel")]
+    pub channel_id: u8,
+    /// On or off
+    pub status: u8,
+}
+
+/// FloodlightStatusList xml
+#[derive(PartialEq, Eq, Default, Debug, YaDeserialize, YaSerialize, Clone)]
+pub struct FloodlightStatusList {
+    /// XML Version
+    #[yaserde(attribute)]
+    pub version: String,
+    /// List of events
+    #[yaserde(rename = "FloodlightStatus")]
+    pub floodlight_status_list: Vec<FloodlightStatus>,
+}
+
+/// FloodlightManual xml
+#[derive(PartialEq, Eq, Default, Debug, YaDeserialize, YaSerialize)]
+pub struct FloodlightManual {
+    /// XML Version
+    #[yaserde(attribute)]
+    pub version: String,
+    /// Channel ID of floodlight
+    #[yaserde(rename = "channelId")]
+    pub channel_id: u8,
+    /// On or off
+    pub status: u8,
+    /// How long the manual control should apply for
+    pub duration: u16,
+}
+
 /// rfAlarmCfg xml
 #[derive(PartialEq, Eq, Default, Debug, YaDeserialize, YaSerialize)]
 pub struct RfAlarmCfg {
@@ -522,7 +573,40 @@ pub struct PtzControl {
     pub channel_id: u8,
     /// The amount of movement to perform
     pub speed: f32,
-    /// The direction to transverse. Known directions: "right"
+    /// The direction to transverse. Known values are `"left"`, `"right"`, `"up"`, `"down"`,
+    /// `"leftUp"`, `"leftDown"`, `"rightUp"`, `"rightDown"` and `"stop"`
+    pub command: String,
+}
+
+/// An XML that describes a list of available PTZ presets
+#[derive(PartialEq, Eq, Default, Debug, YaDeserialize, YaSerialize)]
+pub struct PtzPreset {
+    /// XML Version
+    #[yaserde(attribute)]
+    pub version: String,
+    /// The channel ID. Usually zero unless from an NVR
+    #[yaserde(rename = "channelId")]
+    pub channel_id: u8,
+    /// List of presets
+    #[yaserde(rename = "presetList")]
+    pub preset_list: PresetList,
+}
+
+/// A preset list
+#[derive(PartialEq, Eq, Default, Debug, YaDeserialize, YaSerialize)]
+pub struct PresetList {
+    /// List of Presets
+    pub preset: Vec<Preset>,
+}
+
+/// A preset. Either contains the ID and the name or the ID and the command
+#[derive(PartialEq, Eq, Default, Debug, YaDeserialize, YaSerialize)]
+pub struct Preset {
+    /// The ID of the preset
+    pub id: u8,
+    /// The preset name
+    pub name: Option<String>,
+    /// Command: Known values: `"toPos"` and `"setPos"`
     pub command: String,
 }
 
@@ -628,6 +712,44 @@ pub struct PushInfo {
     /// A client ID, seems to be an all CAPS MD5 hash of something
     #[yaserde(rename = "clientID")]
     pub client_id: String,
+}
+
+/// The Link Type contains the type of connection present
+#[derive(PartialEq, Eq, Default, Debug, YaDeserialize, YaSerialize)]
+pub struct LinkType {
+    #[yaserde(rename = "type")]
+    /// Type of connection known values `"LAN"`
+    pub link_type: String,
+}
+
+/// The Link Type contains the type of connection present
+#[derive(PartialEq, Eq, Default, Debug, YaDeserialize, YaSerialize)]
+pub struct Snap {
+    #[yaserde(rename = "channelId")]
+    /// The channel id to get the snapshot from
+    pub channel_id: u8,
+    /// Unknown, observed values: 0
+    /// value is only set on request
+    #[yaserde(rename = "logicChannel")]
+    pub logic_channel: Option<u8>,
+    /// Time of snapshot, zero when requesting
+    pub time: u32,
+    /// Request a full frame, observed values: 0
+    /// value is only set on request
+    #[yaserde(rename = "fullFrame")]
+    pub full_frame: Option<u32>,
+    /// Stream name, observed values: `main`, `sub`
+    /// value is only set on request
+    #[yaserde(rename = "streamType")]
+    pub stream_type: Option<String>,
+    /// File name, usually of the form `01_20230518140240.jpg`
+    /// value is only set on recieve
+    #[yaserde(rename = "fileName")]
+    pub file_name: Option<String>,
+    /// Size in bytes of the picture
+    /// value is only set on recieve
+    #[yaserde(rename = "pictureSize")]
+    pub picture_size: Option<u32>,
 }
 
 /// Convience function to return the xml version used throughout the library

@@ -3,7 +3,11 @@ use crate::Credentials;
 pub use super::xml::{BcPayloads, BcXml, Extension};
 use std::collections::HashSet;
 
-pub(super) const MAGIC_HEADER: u32 = 0xabcdef0;
+pub(super) const MAGIC_HEADER: u32 = 0x0abcdef0;
+/// Sometimes will get the BE magic header even though all other numbers are LE?
+/// Seems to happens with certain messages like snap that produce jpegs, so perhaps it
+/// it is meant to be a hint as to the endianess of the binary payload
+pub(super) const MAGIC_HEADER_REV: u32 = 0x0fedcba0;
 
 /// Login messages have this ID
 pub const MSG_ID_LOGIN: u32 = 1;
@@ -19,6 +23,8 @@ pub const MSG_ID_TALKABILITY: u32 = 10;
 pub const MSG_ID_TALKRESET: u32 = 11;
 /// PtzControl messages have this ID
 pub const MSG_ID_PTZ_CONTROL: u32 = 18;
+/// PTZ goto preset position
+pub const MSG_ID_PTZ_CONTROL_PRESET: u32 = 19;
 /// Reboot messages have this ID
 pub const MSG_ID_REBOOT: u32 = 23;
 /// Request motion detection messages
@@ -31,12 +37,16 @@ pub const MSG_ID_VERSION: u32 = 80;
 pub const MSG_ID_PING: u32 = 93;
 /// General system info messages have this ID
 pub const MSG_ID_GET_GENERAL: u32 = 104;
+/// Snapshot to get a jpeg image
+pub const MSG_ID_SNAP: u32 = 109;
 /// Used to get the abilities of a user
 pub const MSG_ID_ABILITY_INFO: u32 = 151;
 /// Setting general system info (clock mostly) messages have this ID
 pub const MSG_ID_SET_GENERAL: u32 = 105;
 /// Used to pass the token and client ID for push notifications
 pub const MSG_ID_PUSH_INFO: u32 = 124;
+/// Get the available PTZ position presets
+pub const MSG_ID_GET_PTZ_PRESET: u32 = 190;
 /// Will send the talk config for talk back data to follow this msg
 pub const MSG_ID_TALKCONFIG: u32 = 201;
 /// Used to send talk back binary data
@@ -55,6 +65,10 @@ pub const MSG_ID_UDP_KEEP_ALIVE: u32 = 234;
 pub const MSG_ID_BATTERY_INFO_LIST: u32 = 252;
 /// Battery message initiaed by the client
 pub const MSG_ID_BATTERY_INFO: u32 = 253;
+/// Manual Floodlight Control
+pub const MSG_ID_FLOODLIGHT_MANUAL: u32 = 288;
+/// Floodlight status report from the camera
+pub const MSG_ID_FLOODLIGHT_STATUS_LIST: u32 = 291;
 
 /// An empty password in legacy format
 pub const EMPTY_LEGACY_PASSWORD: &str =

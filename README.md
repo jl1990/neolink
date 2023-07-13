@@ -145,6 +145,17 @@ In the `[[cameras]]` section of the toml.
 Possible values are `local`, `remote`, `map`, `relay` later values implictly
 enable prior methods.
 
+#### Cellular
+
+Cellular cameras should select `"cellular"` which only enables `map` and
+`relay` since `local` and `remote` will always fail
+
+```toml
+discovery = "cellular"
+```
+
+See the sample config file for more details.
+
 ### MQTT
 
 To use mqtt you will to adjust your config file as such:
@@ -179,8 +190,10 @@ Control messages:
 - `/control/ir [on|off|auto]` Turn IR lights on/off or automatically via light
   detection
 - `/control/reboot` Reboot the camera
-- `/control/ptz [up|down|left|right|in|out]` (amount) Control the PTZ
+- `/control/ptz [up|down|left|right|in|out] (amount)` Control the PTZ
   movements, amount defaults to 32.0
+- `/control/ptz/preset [id]` Move the camera to a PTZ preset
+- `/control/ptz/assign [id] [name]` Set the current PTZ position to a preset ID and name
 - `/control/pir [on|off]`
 
 Status Messages:
@@ -190,13 +203,66 @@ Status Messages:
 - `/status disconnected` Sent when the camera goes offline
 - `/status/battery` Sent in reply to a `/query/battery` an XML encoded version
   of the battery status
+- `/status/battery_level` A simple % value of current battery level
 - `/status/pir` Sent in reply to a `/query/pir` an XML encoded version of the
   pir status
+- `/status/motion` Contains the motion detection alarm status. `on` for motion and `off` for still
+- `/status/ptz/preset` Sent in reply to a `/query/ptz/preset` an XML encoded version of the
+  PTZ presets
+- `/status/preview` a base64 encoded camera image updated every 0.5s
 
 Query Messages:
 
 - `/query/battery` Request that the camera reports its battery level
 - `/query/pir` Request that the camera reports its pir status
+- `/query/ptz/preset` Request that the camera reports its PTZ presets
+
+### MQTT Disable Features
+
+Certain features like preview and motion detection may not be desired
+you can disable them by them with the following config options. 
+Disabling these may help to conserve battery
+
+```toml
+enable_motion = false  # motion detection
+                       # (limited battery drain since it
+                       # is a passive listening connection)
+
+enable_pings = false   # keep alive pings that keep the camera connected
+
+enable_light = false   # flood lights only avaliable on some camera
+                       # (limited battery drain since it
+                       # is a passive listening connection)
+
+enable_battery = false # battery updates in `/status/battery_level`
+
+enable_preview = false # preview image in `/status/preview`
+```
+
+#### MQTT Discovery
+
+[MQTT Discovery](https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery) is partially supported. 
+Currently, discovery is opt-in and camera features must be manually specified.
+
+```toml
+[cameras.mqtt]
+  # <see above>
+  [cameras.mqtt.discovery]
+  topic = "homeassistant"
+  features = ["floodlight"]
+```
+
+Avaliable features are:
+
+- `floodlight`: This adds a light control to home assistant
+- `camera`: This adds a camera preview to home assistant. It is only updated every 0.5s and cannot be much more than that since it is updated over mqtt not over RTSP
+- `led`: This adds a switch to chage the LED status light on/off to home assistant
+- `ir`: This adds a selection switch to chage the IR light on/off/auto to home assistant
+- `motion`: This adds a motion detection binary sensor to home assistant
+- `reboot`: This adds a reboot button  to home assistant
+- `pt`: This adds a selection of buttons to control the pan and tilt of the camera
+- `battery`: This adds a battery level sensor to home assistant
+
 
 ### Pause
 
@@ -240,11 +306,18 @@ passed by a script for processing.
 
 [Docker](https://hub.docker.com/r/quantumentangledandy/neolink) builds are also
 provided in multiple architectures. The latest tag tracks master while each
-
 branch gets it's own tag.
 
 ```bash
 docker pull quantumentangledandy/neolink
+
+# Add `-e "RUST_LOG=debug"` to run with debug logs
+#
+# --network host is only needed if you require to connect
+# via local broadcasts. If you can connect via any other
+# method then normal bridge mode should work fine
+# and you can ommit this option
+docker run --network host --volume=$PWD/config.toml:/etc/neolink.toml quantumentangledandy/neolink
 ```
 
 ### Image
@@ -255,11 +328,10 @@ You can write an image from the stream to disk using:
 neolink image --config=config.toml --file-path=filepath CameraName
 ```
 
-Where filepath is the path to save the image to and CameraName is the name o
+Where filepath is the path to save the image to and CameraName is the name of
 the camera from the config to save the image from.
 
 File is always jpeg and the extension given in filepath will be added or changed
-
 to reflect this.
 
 ## License

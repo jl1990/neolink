@@ -38,6 +38,10 @@ address = "192.168.1.187:9000"
 # mqtt.broker_addr = "192.168.1.122"
 # mqtt.port = 1883
 # mqtt.credentials = ["mqtt_user", "mqtt_password"]
+# MQTT Discovery: https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery
+# mqtt.discovery.topic = "homeassistant" # Uncomment to enable
+# If using discovery, _ characters are replaced with spaces in the name and title case is applied
+# mqtt.discovery.features = ["floodlight"] # Uncomment if this camera has a spotlight/floodlight
 
 # If you use a battery camera: **Instead** of an `address` supply the uid
 # as follows
@@ -60,6 +64,8 @@ address = "192.168.1.187:9000"
 # "map" # Register our local ip address with reolink and ask the camera to connect to us but don't relay data through reolink
 # "remote" # Register our local ip address with reolink but only permit same network connections (useful if broadcast is not possible)
 # "local" # Do not contact reolink servers at all. Rely soley on local UDP broadcast based discovery
+#
+# "cellular" # Cellular camera only support Relay and Map to speed up connecting to them this option will skip the local/remote
 #
 # discovery = "relay"
 
