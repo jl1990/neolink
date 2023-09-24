@@ -11,30 +11,32 @@ use crate::bcudp::xml::*;
 use crate::{Error, Result};
 use futures::{
     sink::SinkExt,
-    stream::{FuturesUnordered, StreamExt},
+    stream::{FuturesUnordered, Stream, StreamExt},
 };
 use lazy_static::lazy_static;
 use local_ip_address::local_ip;
 use log::*;
 use rand::{seq::SliceRandom, thread_rng, Rng};
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{btree_map::Entry, BTreeMap, HashSet};
 use std::convert::TryInto;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+use tokio::time::MissedTickBehavior;
 use tokio::{
     net::UdpSocket,
     sync::{
         mpsc::{channel, Receiver, Sender},
-        RwLock,
+        RwLock, Semaphore,
     },
     task::JoinSet,
     time::{interval, timeout, Duration},
 };
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tokio_util::udp::UdpFramed;
 
 #[derive(Debug, Clone)]
-struct RegisterResult {
+pub(crate) struct RegisterResult {
     reg: SocketAddr,
     dev: Option<SocketAddr>,
     dmap: Option<SocketAddr>,
@@ -57,36 +59,62 @@ struct UidLookupResults {
     relay: SocketAddr,
 }
 
-pub(crate) struct Discovery {}
-
 const MTU: u32 = 1350;
 lazy_static! {
-    static ref P2P_RELAY_HOSTNAMES: [&'static str; 10] = [
+    static ref P2P_RELAY_HOSTNAMES: [&'static str; 12] = [
         "p2p.reolink.com",
         "p2p1.reolink.com",
         "p2p2.reolink.com",
         "p2p3.reolink.com",
+        "p2p4.reolink.com",
+        "p2p5.reolink.com",
         "p2p6.reolink.com",
         "p2p7.reolink.com",
         "p2p8.reolink.com",
         "p2p9.reolink.com",
-        "p2p14.reolink.com",
-        "p2p15.reolink.com",
+        "p2p10.reolink.com",
+        "p2p11.reolink.com",
+        // These following are all currently set to 127.0.0.1
+        // probably reserved for future use
+        // "p2p12.reolink.com",
+        // "p2p13.reolink.com",
+        // "p2p14.reolink.com",
+        // "p2p15.reolink.com",
+        // "p2p16.reolink.com",
     ];
     /// Maximum wait for a reply
-    static ref MAXIMUM_WAIT: Duration = Duration::from_secs(5);
+    static ref MAXIMUM_WAIT: Duration = Duration::from_secs(15);
+    /// Wait for tcp connections
+    static ref TCP_WAIT: Duration = Duration::from_secs(4);
     /// How long to wait before resending
     static ref RESEND_WAIT: Duration = Duration::from_millis(500);
+
 }
 
 type Subscriber = Arc<RwLock<BTreeMap<u32, Sender<Result<(UdpDiscovery, SocketAddr)>>>>>;
+type Handlers = Arc<RwLock<Vec<Sender<Result<(UdpDiscovery, SocketAddr)>>>>>;
 type ArcFramedSocket = UdpFramed<BcUdpCodex, Arc<UdpSocket>>;
 pub(crate) struct Discoverer {
+    semaphore: Arc<Semaphore>,
     socket: Arc<UdpSocket>,
-    handle: RwLock<JoinSet<()>>,
+    handle: RwLock<JoinSet<Result<()>>>,
     writer: Sender<Result<(BcUdp, SocketAddr)>>,
     subsribers: Subscriber,
+    handlers: Handlers,
     local_addr: SocketAddr,
+    cancel: CancellationToken,
+}
+
+fn valid_ip(ip: &str) -> bool {
+    !ip.is_empty() && matches!(ip.parse::<Ipv4Addr>(), Ok(addr) if addr.octets()[3] != 0)
+}
+
+fn valid_port(port: u16) -> bool {
+    port != 0
+}
+
+fn valid_addr(ip_port: &IpPort) -> bool {
+    valid_ip(&ip_port.ip) && valid_port(ip_port.port)
 }
 
 impl Discoverer {
@@ -94,91 +122,119 @@ impl Discoverer {
         let socket = Arc::new(connect().await?);
         let local_addr = socket.local_addr()?;
         let inner: ArcFramedSocket = UdpFramed::new(socket.clone(), BcUdpCodex::new());
+        let cancel = CancellationToken::new();
 
         let (mut writer, mut reader) = inner.split();
         let mut set = JoinSet::new();
         let subsribers: Subscriber = Default::default();
+        let handlers: Handlers = Default::default();
 
         let thread_subscriber = subsribers.clone();
+        let thread_handlers = handlers.clone();
+        let thread_cancel = cancel.clone();
         set.spawn(async move {
-            loop {
-                tokio::task::yield_now().await;
-                match reader.next().await {
-                    Some(Ok((BcUdp::Discovery(bcudp), addr))) => {
-                        let mut tid = bcudp.tid;
-                        let mut needs_removal = false;
-                        if let Some(sender) = thread_subscriber.read().await.get(&tid) {
-                            if sender.send(Ok((bcudp, addr))).await.is_err() {
-                                needs_removal = true;
+            tokio::select! {
+                _ = thread_cancel.cancelled() => Result::Ok(()),
+                v = async {
+                    loop {
+                        tokio::task::yield_now().await;
+                        match reader.next().await {
+                            Some(Ok((BcUdp::Discovery(bcudp), addr))) => {
+                                let tid = bcudp.tid;
+                                let mut needs_removal = false;
+                                if let (Some(sender), true) =
+                                    (thread_subscriber.read().await.get(&tid), tid > 0)
+                                {
+                                    if sender.send(Ok((bcudp, addr))).await.is_err() {
+                                        needs_removal = true;
+                                    }
+                                } else {
+                                    for sender in thread_handlers.write().await.iter_mut() {
+                                        let _ = sender.send(Ok((bcudp.clone(), addr))).await;
+                                    }
+                                }
+                                if needs_removal {
+                                    thread_subscriber.write().await.remove(&tid);
+                                }
                             }
-                        } else if let Some(any_sender) = thread_subscriber.read().await.get(&0) {
-                            if any_sender.send(Ok((bcudp, addr))).await.is_err() {
-                                tid = 0; // To make is remove 0
-                                needs_removal = true;
+                            Some(Ok(bcudp)) => {
+                                // Only discovery packets should be possible atm
+                                trace!("Got non Discovery during discovery: {:?}", bcudp);
                             }
-                        } else {
-                            trace!("Udp Discovery got this unexpected BcUdp {:?}", bcudp);
-                        }
-                        if needs_removal {
-                            thread_subscriber.write().await.remove(&tid);
+                            Some(Err(e)) => {
+                                let mut locked_sub = thread_subscriber.write().await;
+                                for (_, sub) in locked_sub.iter() {
+                                    let _ = sub.send(Err(e.clone())).await;
+                                }
+                                locked_sub.clear();
+                                break Result::Ok(());
+                            }
+                            None => break Result::Ok(()),
                         }
                     }
-                    Some(Ok(bcudp)) => {
-                        // Only discovery packets should be possible atm
-                        trace!("Got non Discovery during discovery: {:?}", bcudp);
-                    }
-                    Some(Err(e)) => {
-                        let mut locked_sub = thread_subscriber.write().await;
-                        for (_, sub) in locked_sub.iter() {
-                            let _ = sub.send(Err(e.clone())).await;
-                        }
-                        locked_sub.clear();
-                        break;
-                    }
-                    None => break,
-                }
+                }=> v,
             }
         });
 
-        let (sinker, sinker_rx) = channel(100);
+        let (sinker, sinker_rx) = channel::<Result<(BcUdp, SocketAddr)>>(100);
+        let thread_cancel = cancel.clone();
         set.spawn(async move {
-            let _ = writer.send_all(&mut ReceiverStream::new(sinker_rx)).await;
+            tokio::select! {
+                _ = thread_cancel.cancelled() => Result::Ok(()),
+                v = async {
+                    let mut sinker_rx = ReceiverStream::new(sinker_rx);
+                    while let Some(Ok(packet)) = sinker_rx.next().await {
+                        let _ = writer.send(packet).await;
+                    }
+                    Result::Ok(())
+                } => v,
+            }
         });
 
         Ok(Discoverer {
+            semaphore: Arc::new(Semaphore::new(1)),
             socket,
             handle: RwLock::new(set),
             writer: sinker,
             subsribers,
+            handlers,
             local_addr,
+            cancel,
         })
     }
 
-    async fn into_socket(self) -> (Arc<UdpSocket>, JoinSet<()>) {
-        let socket = self.socket.clone();
-        let handle = self.handle.into_inner();
-        (socket, handle)
+    async fn get_socket(&self) -> Arc<UdpSocket> {
+        self.socket.clone()
     }
 
     async fn subscribe(&self, tid: u32) -> Result<Receiver<Result<(UdpDiscovery, SocketAddr)>>> {
-        let mut subs = self.subsribers.write().await;
-        match subs.entry(tid) {
-            Entry::Vacant(vacant) => {
-                let (tx, rx) = channel(10);
-                vacant.insert(tx);
-                Ok(rx)
-            }
-            Entry::Occupied(mut occ) => {
-                if occ.get().is_closed() {
+        if tid > 0 {
+            let mut subs = self.subsribers.write().await;
+            match subs.entry(tid) {
+                Entry::Vacant(vacant) => {
                     let (tx, rx) = channel(10);
-                    occ.insert(tx);
+                    vacant.insert(tx);
                     Ok(rx)
-                } else {
-                    Err(Error::SimultaneousSubscription {
-                        msg_num: Some(tid as u16),
-                    })
+                }
+                Entry::Occupied(mut occ) => {
+                    if occ.get().is_closed() {
+                        let (tx, rx) = channel(10);
+                        occ.insert(tx);
+                        Ok(rx)
+                    } else {
+                        // log::error!("Failed to subscribe in discovery to {:?}", tid);
+                        Err(Error::SimultaneousSubscription {
+                            msg_num: Some(tid as u16),
+                        })
+                    }
                 }
             }
+        } else {
+            // If tid is zero we listen to all!
+            let mut handlers = self.handlers.write().await;
+            let (tx, rx) = channel(10);
+            handlers.push(tx);
+            Ok(rx)
         }
     }
 
@@ -214,32 +270,6 @@ impl Discoverer {
         &self.local_addr
     }
 
-    async fn retry_send_multi<F, T>(
-        &self,
-        mut disc: UdpDiscovery,
-        dests: &[SocketAddr],
-        map: F,
-    ) -> Result<T>
-    where
-        F: Fn(UdpDiscovery, SocketAddr) -> Option<T>,
-    {
-        trace!("Retrying send");
-        disc.tid = 0; // Must be random to avoid simulatenous subscription errors
-        let mut set = FuturesUnordered::new();
-        for dest in dests.iter() {
-            set.push(self.retry_send(disc.clone(), *dest, &map));
-        }
-
-        // Get what ever completes first
-        while let Some(result) = set.next().await {
-            trace!("Result: {}", result.is_ok());
-            if let Ok(ret) = result {
-                return Ok(ret);
-            }
-        }
-        Err(Error::DiscoveryTimeout)
-    }
-
     async fn retry_send<F, T>(&self, mut disc: UdpDiscovery, dest: SocketAddr, map: F) -> Result<T>
     where
         F: Fn(UdpDiscovery, SocketAddr) -> Option<T>,
@@ -257,6 +287,7 @@ impl Discoverer {
         let msg = BcUdp::Discovery(disc);
 
         let mut inter = interval(*RESEND_WAIT);
+        inter.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         let result = tokio::select! {
             v = async {
@@ -296,7 +327,8 @@ impl Discoverer {
             let target_tid = generate_tid();
             disc.tid = target_tid;
         }
-        let mut inter = interval(Duration::from_millis(50));
+        let mut inter = interval(*RESEND_WAIT);
+        inter.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let msg = BcUdp::Discovery(disc);
 
         for _i in 0..5 {
@@ -357,13 +389,10 @@ impl Discoverer {
         Ok(result)
     }
 
-    /// This function will contact the p2p relay servers
-    ///
-    /// It will ask each of the servers for details on a specific UID
-    ///
-    /// On success it returns the M2cQr that the p2p relay
-    /// server has about the UID
-    async fn uid_loopup(&self, uid: &str) -> Result<UidLookupResults> {
+    async fn uid_lookup_all<'a>(
+        &'a self,
+        uid: &'a str,
+    ) -> Result<impl Stream<Item = UidLookupResults> + 'a> {
         let task = tokio::task::spawn_blocking(move || {
             let mut addrs = vec![];
             for p2p_relay in P2P_RELAY_HOSTNAMES.iter() {
@@ -376,8 +405,22 @@ impl Discoverer {
             }
             addrs
         });
-        let addrs = timeout(*MAXIMUM_WAIT, task).await??;
+        let mut addrs = timeout(*MAXIMUM_WAIT, task).await??;
         trace!("Uid lookup to: {:?}", addrs);
+
+        Ok(addrs
+            .drain(..)
+            .map(|addr| self.uid_lookup(uid, addr))
+            .collect::<FuturesUnordered<_>>()
+            .filter_map(|f| async { f.ok() }))
+    }
+    /// This function will contact the p2p relay servers
+    ///
+    /// It will ask each of the servers for details on a specific UID
+    ///
+    /// On success it will returns an async iter that yields the M2cQr that the p2p relay
+    /// server has about the UID
+    async fn uid_lookup(&self, uid: &str, addr: SocketAddr) -> Result<UidLookupResults> {
         let msg = UdpDiscovery {
             tid: 0,
             payload: UdpXml {
@@ -390,7 +433,7 @@ impl Discoverer {
         };
         trace!("Sending look up {:?}", msg);
         let (packet, _) = self
-            .retry_send_multi(msg, addrs.as_slice(), |bc, addr| match bc {
+            .retry_send(msg, addr, |bc, addr| match bc {
                 UdpDiscovery {
                     tid: _,
                     payload:
@@ -398,7 +441,7 @@ impl Discoverer {
                             m2c_q_r: Some(m2c_q_r),
                             ..
                         },
-                } if m2c_q_r.reg.port != 0 || !m2c_q_r.reg.ip.is_empty() => Some((m2c_q_r, addr)),
+                } if valid_addr(&m2c_q_r.reg) => Some((m2c_q_r, addr)),
                 _ => None,
             })
             .await?;
@@ -450,51 +493,85 @@ impl Discoverer {
 
         // Send and await acceptance
         let (sid, dev, dmap, relay) = self
-            .retry_send(msg, lookup.reg, |bc, _| match bc {
-                UdpDiscovery {
-                    tid: _,
-                    payload:
-                        UdpXml {
-                            r2c_c_r:
-                                Some(R2cCr {
-                                    dmap,
-                                    dev,
-                                    relay,
-                                    sid,
-                                    rsp,
-                                    ..
-                                }),
-                            ..
-                        },
-                } if (dev.as_ref().map(|d| !d.ip.is_empty()).unwrap_or(false)
-                    || dmap.as_ref().map(|d| !d.ip.is_empty()).unwrap_or(false)
-                    || relay.as_ref().map(|d| !d.ip.is_empty()).unwrap_or(false))
-                    && rsp != -1 =>
-                {
-                    Some(Ok((sid, dev, dmap, relay)))
+            .retry_send(msg, lookup.reg, |bc, socket| {
+                trace!("{}", socket.ip());
+                match bc {
+                    UdpDiscovery {
+                        tid: _,
+                        payload:
+                            UdpXml {
+                                r2c_c_r:
+                                    Some(R2cCr {
+                                        dmap,
+                                        dev,
+                                        relay,
+                                        sid,
+                                        rsp,
+                                        ..
+                                    }),
+                                ..
+                            },
+                    } if (dev.as_ref().map(valid_addr).unwrap_or(false)
+                        || dmap.as_ref().map(valid_addr).unwrap_or(false)
+                        || relay.as_ref().map(valid_addr).unwrap_or(false))
+                        && rsp != -1 =>
+                    {
+                        Some(Ok((sid, dev, dmap, relay)))
+                    }
+                    // UdpDiscovery {
+                    //     tid: _,
+                    //     payload:
+                    //         UdpXml {
+                    //             r2c_c_r:
+                    //                 Some(R2cCr {
+                    //                     dmap,
+                    //                     dev,
+                    //                     relay: Some(mut relay),
+                    //                     sid,
+                    //                     rsp,
+                    //                     ..
+                    //                 }),
+                    //             ..
+                    //         },
+                    // } if (dev
+                    //     .as_ref()
+                    //     .map(valid_addr)
+                    //     .unwrap_or(false)
+                    //     || dmap
+                    //         .as_ref()
+                    //         .map(valid_addr)
+                    //         .unwrap_or(false)
+                    //     || (relay.ip == format!("{}", socket.ip()) && relay.port == 0))
+                    //     && rsp != -1 =>
+                    // {
+                    //     // For a relay connection if port is 0 and the ip is the current socker addr
+                    //     // we use the current port
+                    //     relay.port = socket.port();
+                    //     Some(Ok((sid, dev, dmap, Some(relay))))
+                    // }
+                    UdpDiscovery {
+                        tid: _,
+                        payload:
+                            UdpXml {
+                                r2c_c_r:
+                                    Some(R2cCr {
+                                        dev,
+                                        dmap,
+                                        relay,
+                                        rsp,
+                                        ..
+                                    }),
+                                ..
+                            },
+                    } if (dev.as_ref().map(valid_addr).unwrap_or(false)
+                        || dmap.as_ref().map(valid_addr).unwrap_or(false)
+                        || relay.as_ref().map(valid_addr).unwrap_or(false))
+                        && rsp == -1 =>
+                    {
+                        Some(Err(Error::RegisterError))
+                    }
+                    _ => None,
                 }
-                UdpDiscovery {
-                    tid: _,
-                    payload:
-                        UdpXml {
-                            r2c_c_r:
-                                Some(R2cCr {
-                                    dev,
-                                    dmap,
-                                    relay,
-                                    rsp,
-                                    ..
-                                }),
-                            ..
-                        },
-                } if (dev.as_ref().map(|d| !d.ip.is_empty()).unwrap_or(false)
-                    || dmap.as_ref().map(|d| !d.ip.is_empty()).unwrap_or(false)
-                    || relay.as_ref().map(|d| !d.ip.is_empty()).unwrap_or(false))
-                    && rsp == -1 =>
-                {
-                    Some(Err(Error::RegisterError))
-                }
-                _ => None,
             })
             .await??;
 
@@ -566,6 +643,12 @@ impl Discoverer {
             },
         };
 
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Other("Discovery already complete"))?;
         // Send and await confirm
         self.retry_send(msg, addr, |bc, _| {
             trace!("msg: {:?}", &bc);
@@ -622,6 +705,8 @@ impl Discoverer {
 
         self.keep_alive_device(local_tid, &result).await;
 
+        self.semaphore.close();
+        drop(permit);
         Ok(result)
     }
 
@@ -683,6 +768,12 @@ impl Discoverer {
             },
         };
 
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Other("Discovery already complete"))?;
         // Send and await confirm
         self.retry_send(msg, addr, |bc, _| {
             trace!("msg: {:?}", &bc);
@@ -739,6 +830,8 @@ impl Discoverer {
 
         self.keep_alive_device(local_tid, &result).await;
 
+        self.semaphore.close();
+        drop(permit);
         Ok(result)
     }
 
@@ -785,6 +878,12 @@ impl Discoverer {
             camera_id: local_did,
         };
 
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Other("Discovery already complete"))?;
         // Confirm local to register
         let msg = UdpDiscovery {
             tid: 0,
@@ -804,6 +903,8 @@ impl Discoverer {
 
         self.keep_alive_device(tid, &result).await;
 
+        self.semaphore.close();
+        drop(permit);
         Ok(result)
     }
 
@@ -827,6 +928,12 @@ impl Discoverer {
             },
         };
 
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Other("Discovery already complete"))?;
         let (final_addr, local_did) = self
             .retry_send(msg, relay_addr, |bc, addr| match bc {
                 UdpDiscovery {
@@ -880,6 +987,8 @@ impl Discoverer {
         self.keep_alive_device(tid, &result).await;
         // self.keep_alive_relay(tid, &result).await;
 
+        self.semaphore.close();
+        drop(permit);
         Ok(result)
     }
 
@@ -889,23 +998,29 @@ impl Discoverer {
         let addr = connect_result.addr;
         let mut sender = ArcFramedSocket::new(self.socket.clone(), BcUdpCodex::new());
         let mut interval = interval(Duration::from_secs(1));
+        let thread_cancel = self.cancel.clone();
         self.handle.write().await.spawn(async move {
-            loop {
-                tokio::task::yield_now().await;
-                interval.tick().await;
-                let msg = BcUdp::Discovery(UdpDiscovery {
-                    tid,
-                    payload: UdpXml {
-                        c2d_hb: Some(C2dHb {
-                            cid: client_id,
-                            did: camera_id,
-                        }),
-                        ..Default::default()
-                    },
-                });
-                if sender.send((msg, addr)).await.is_err() {
-                    return;
-                }
+            tokio::select! {
+                _ = thread_cancel.cancelled() => Result::Ok(()),
+                v = async {
+                    loop {
+                        tokio::task::yield_now().await;
+                        interval.tick().await;
+                        let msg = BcUdp::Discovery(UdpDiscovery {
+                            tid,
+                            payload: UdpXml {
+                                c2d_hb: Some(C2dHb {
+                                    cid: client_id,
+                                    did: camera_id,
+                                }),
+                                ..Default::default()
+                            },
+                        });
+                        if sender.send((msg, addr)).await.is_err() {
+                            break Result::Ok(());
+                        }
+                    }
+                } => v,
             }
         });
     }
@@ -918,38 +1033,105 @@ impl Discoverer {
         let addr = connect_result.addr;
         let mut sender = ArcFramedSocket::new(self.socket.clone(), BcUdpCodex::new());
         let mut interval = interval(Duration::from_secs(1));
+        let thread_cancel = self.cancel.clone();
         self.handle.write().await.spawn(async move {
-            loop {
-                tokio::task::yield_now().await;
-                interval.tick().await;
-                let msg = BcUdp::Discovery(UdpDiscovery {
-                    tid,
-                    payload: UdpXml {
-                        c2r_hb: Some(C2rHb {
-                            sid,
-                            cid: client_id,
-                            did: camera_id,
-                        }),
-                        ..Default::default()
-                    },
-                });
-                if sender.send((msg, addr)).await.is_err() {
-                    return;
-                }
+            tokio::select! {
+                _ = thread_cancel.cancelled() => Result::Ok(()),
+                v = async {
+                    loop {
+                        tokio::task::yield_now().await;
+                        interval.tick().await;
+                        let msg = BcUdp::Discovery(UdpDiscovery {
+                            tid,
+                            payload: UdpXml {
+                                c2r_hb: Some(C2rHb {
+                                    sid,
+                                    cid: client_id,
+                                    did: camera_id,
+                                }),
+                                ..Default::default()
+                            },
+                        });
+                        if sender.send((msg, addr)).await.is_err() {
+                            break Result::Ok(());
+                        }
+                    }
+                } => v,
             }
         });
     }
 }
 
+impl Drop for Discoverer {
+    fn drop(&mut self) {
+        log::trace!("Drop Discoverer");
+        self.cancel.cancel();
+        tokio::task::block_in_place(move || {
+            let _ = tokio::runtime::Handle::current().block_on(async move {
+                while self.handle.get_mut().join_next().await.is_some() {}
+                Result::Ok(())
+            });
+        });
+        log::trace!("Dropped Discoverer");
+    }
+}
+
+pub(crate) struct Discovery {
+    discoverer: Discoverer,
+    client_id: i32,
+}
+
 impl Discovery {
+    pub(crate) async fn new() -> Result<Self> {
+        Ok(Self {
+            discoverer: Discoverer::new().await?,
+            client_id: generate_cid(),
+        })
+    }
+
+    pub(crate) async fn get_registration(&self, uid: &str) -> Result<RegisterResult> {
+        let lookups = self.discoverer.uid_lookup_all(uid).await?;
+
+        let checked_reg = Arc::new(RwLock::new(HashSet::new()));
+        let reg_result = Box::pin(
+            lookups
+                .then(|lookup| {
+                    let discoverer = &self.discoverer;
+                    let client_id = self.client_id;
+
+                    let thread_checked_reg = checked_reg.clone();
+                    async move {
+                        let mut locked_checked_reg = thread_checked_reg.write().await;
+                        if locked_checked_reg.contains(&lookup.reg) {
+                            return Result::Err(Error::Other("Already checked."));
+                        }
+                        locked_checked_reg.insert(lookup.reg);
+                        drop(locked_checked_reg);
+                        trace!("lookup: {:?}", lookup);
+                        let reg_result = discoverer.register_address(uid, client_id, &lookup).await;
+                        trace!("reg_result: {:?}", reg_result);
+                        reg_result
+                    }
+                })
+                .filter_map(|f| async { f.ok() }),
+        )
+        .next()
+        .await
+        .ok_or(Error::Other(
+            "No reolink registers returned valid device data.",
+        ))?;
+
+        Ok(reg_result)
+    }
+
     // Check if TCP is possible
     //
     // To do this we send a dummy login  and see if it replies with any BC packet
-    pub(crate) async fn check_tcp(addr: SocketAddr, channel_id: u8) -> Result<()> {
+    pub(crate) async fn check_tcp(&self, addr: SocketAddr, channel_id: u8) -> Result<()> {
         let username = "admin";
         let password = Some("123456");
         let mut tcp_source =
-            timeout(*MAXIMUM_WAIT, TcpSource::new(addr, username, password)).await??;
+            timeout(*TCP_WAIT, TcpSource::new(addr, username, password, false)).await??;
 
         let md5_username = md5_string(username, Md5Trunc::ZeroLast);
         let md5_password = password
@@ -973,7 +1155,7 @@ impl Discovery {
             })
             .await?;
 
-        let _bc: Bc = timeout(*MAXIMUM_WAIT, tcp_source.next())
+        let _bc: Bc = timeout(*TCP_WAIT, tcp_source.next())
             .await?
             .ok_or(Error::CannotInitCamera)??; // Successful recv should mean a Bc packet if not then deser will fail
         Ok(())
@@ -981,18 +1163,17 @@ impl Discovery {
 
     // Perform UDP broadcast lookup and connection
     pub(crate) async fn local(
+        &self,
         uid: &str,
         mut optional_addrs: Option<Vec<SocketAddr>>,
     ) -> Result<DiscoveryResult> {
-        let discoverer = Discoverer::new().await?;
-
-        let client_id = generate_cid();
         let mut dests = get_broadcasts(&[2015, 2018])?;
         if let Some(mut optional_addrs) = optional_addrs.take() {
             trace!("Also sending to {:?}", optional_addrs);
             dests.append(&mut optional_addrs);
         }
-        let discoverer_ref = &discoverer;
+        let discoverer_ref = &self.discoverer;
+        let client_id = self.client_id;
         let mut futures = FuturesUnordered::new();
         for addr in dests.iter().copied() {
             futures.push(async move {
@@ -1020,10 +1201,9 @@ impl Discovery {
         drop(futures);
         // drop(discoverer_ref);
 
-        let (socket, keep_alive_tasks) = discoverer.into_socket().await;
+        let socket = self.discoverer.get_socket().await;
         Ok(DiscoveryResult {
             socket,
-            keep_alive_tasks,
             addr: connect_result.addr,
             camera_id: connect_result.camera_id,
             client_id: connect_result.client_id,
@@ -1041,33 +1221,22 @@ impl Discovery {
     // This method is best when broadcasts are not possible but we can contact the camera
     // directly
     #[allow(unused)]
-    pub(crate) async fn remote(uid: &str) -> Result<DiscoveryResult> {
+    pub(crate) async fn remote(
+        &self,
+        uid: &str,
+        reg_result: &RegisterResult,
+    ) -> Result<DiscoveryResult> {
         trace!("Start remote");
-        let mut discoverer = Discoverer::new().await?;
-
-        let client_id = generate_cid();
-        trace!("client_id: {}", client_id);
-
-        let lookup = discoverer.uid_loopup(uid).await?;
-        trace!("lookup: {:?}", lookup);
-        let reg_addr = lookup.reg;
-        let relay_addr = lookup.relay;
-
-        let reg_result = discoverer.register_address(uid, client_id, &lookup).await?;
-        trace!("reg_result: {:?}", reg_result);
-
         let connect_result = tokio::select! {
-            v = discoverer.client_initiated_dev(&reg_result) => {v},
-            v = discoverer.device_initiated_dev(&reg_result) => {v},
+            v = self.discoverer.client_initiated_dev(reg_result) => {v},
+            v = self.discoverer.device_initiated_dev(reg_result) => {v},
         }?;
         trace!("connect_result: {:?}", connect_result);
-
-        let (socket, keep_alive_tasks) = discoverer.into_socket().await;
+        let socket = self.discoverer.get_socket().await;
         Ok(DiscoveryResult {
             socket,
-            keep_alive_tasks,
             addr: connect_result.addr,
-            client_id,
+            client_id: self.client_id,
             camera_id: connect_result.camera_id,
         })
     }
@@ -1080,27 +1249,15 @@ impl Discovery {
     //
     // This method should be used when the camera is behind a NAT or firewall but we are
     // reachable
-    pub(crate) async fn map(uid: &str) -> Result<DiscoveryResult> {
-        let discoverer = Discoverer::new().await?;
-
-        let client_id = generate_cid();
-        trace!("client_id: {}", client_id);
-
-        let lookup = discoverer.uid_loopup(uid).await?;
-        trace!("lookup: {:?}", lookup);
-
-        let reg_result = discoverer.register_address(uid, client_id, &lookup).await?;
-        trace!("reg_result: {:?}", reg_result);
-
-        let connect_result = discoverer.device_initiated_map(&reg_result).await?;
+    pub(crate) async fn map(&self, reg_result: &RegisterResult) -> Result<DiscoveryResult> {
+        let connect_result = self.discoverer.device_initiated_map(reg_result).await?;
         trace!("connect_result: {:?}", connect_result);
 
-        let (socket, keep_alive_tasks) = discoverer.into_socket().await;
+        let socket = self.discoverer.get_socket().await;
         Ok(DiscoveryResult {
             socket,
-            keep_alive_tasks,
             addr: connect_result.addr,
-            client_id,
+            client_id: self.client_id,
             camera_id: connect_result.camera_id,
         })
     }
@@ -1110,27 +1267,15 @@ impl Discovery {
     // This method should work if all else fails but it will require
     // us to trust reolink with our data once more...
     //
-    pub(crate) async fn relay(uid: &str) -> Result<DiscoveryResult> {
-        let discoverer = Discoverer::new().await?;
-        let client_id = generate_cid();
-
-        trace!("client_id: {}", client_id);
-
-        let lookup = discoverer.uid_loopup(uid).await?;
-        trace!("lookup: {:?}", lookup);
-
-        let reg_result = discoverer.register_address(uid, client_id, &lookup).await?;
-        trace!("reg_result: {:?}", reg_result);
-
-        let connect_result = discoverer.client_initiated_relay(&reg_result).await?;
+    pub(crate) async fn relay(&self, reg_result: &RegisterResult) -> Result<DiscoveryResult> {
+        let connect_result = self.discoverer.client_initiated_relay(reg_result).await?;
         trace!("connect_result: {:?}", connect_result);
 
-        let (socket, keep_alive_tasks) = discoverer.into_socket().await;
+        let socket = self.discoverer.get_socket().await;
         Ok(DiscoveryResult {
             socket,
-            keep_alive_tasks,
             addr: connect_result.addr,
-            client_id,
+            client_id: self.client_id,
             camera_id: connect_result.camera_id,
         })
     }

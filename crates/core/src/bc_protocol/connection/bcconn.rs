@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::yield_now;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::PollSender;
+use tokio_util::sync::{CancellationToken, PollSender};
 
 use tokio::{sync::RwLock, task::JoinSet};
 
@@ -19,6 +19,9 @@ type MsgHandler = dyn 'static + Send + Sync + for<'a> Fn(&'a Bc) -> BoxFuture<'a
 #[derive(Default)]
 struct Subscriber {
     /// Subscribers based on their ID and their num
+    /// First filtered by ID then number
+    /// If num is None it will be upgraded to a Some based on the number the
+    /// camera assigns
     num: BTreeMap<u32, BTreeMap<Option<u16>, Sender<Result<Bc>>>>,
     /// Subscribers based on their ID
     id: BTreeMap<u32, Arc<MsgHandler>>,
@@ -36,11 +39,13 @@ pub struct BcConnection {
     sink: Sender<Result<Bc>>,
     poll_commander: Sender<PollCommand>,
     rx_thread: RwLock<JoinSet<Result<()>>>,
+    cancel: CancellationToken,
 }
 
 impl BcConnection {
-    pub async fn new(mut sink: BcConnSink, source: BcConnSource) -> Result<BcConnection> {
+    pub async fn new(mut sink: BcConnSink, mut source: BcConnSource) -> Result<BcConnection> {
         let (sinker, sinker_rx) = channel::<Result<Bc>>(100);
+        let cancel = CancellationToken::new();
 
         let (poll_commander, poll_commanded) = channel(200);
         let mut poller = Poller {
@@ -51,25 +56,56 @@ impl BcConnection {
 
         let mut rx_thread = JoinSet::<Result<()>>::new();
         let thread_poll_commander = poll_commander.clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
+        let thread_cancel = cancel.clone();
+        rx_thread.spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
                 .build()
                 .unwrap();
-            runtime.block_on(
-                PollSender::new(thread_poll_commander)
-                    .send_all(&mut source.map(|bc| Ok(PollCommand::Bc(Box::new(bc))))),
-            )
-        });
-        rx_thread.spawn(async move {
-            handle.await??;
-            Ok(())
+            let result = runtime.block_on(async move {
+                tokio::select! {
+                    _ = thread_cancel.cancelled() => {
+                        Result::Ok(())
+                    },
+                    v = async {
+                        let mut sender = PollSender::new(thread_poll_commander);
+                        while let Some(bc) = source.next().await {
+                            sender.send(PollCommand::Bc(Box::new(bc))).await?;
+                        }
+                        Result::Ok(())
+                    } => v
+                }
+            });
+            log::trace!("PollSender Bc {:?}", result);
+            result
         });
 
-        rx_thread.spawn(async move { sink.send_all(&mut ReceiverStream::new(sinker_rx)).await });
-
+        let thread_cancel = cancel.clone();
         rx_thread.spawn(async move {
-            loop {
-                poller.run().await?;
+            tokio::select! {
+                _ = thread_cancel.cancelled() => Result::Ok(()),
+                v = async {
+                    let mut stream = ReceiverStream::new(sinker_rx);
+                    while let Some(packet) = stream.next().await {
+                        sink.send(packet?).await?;
+                    }
+                    Ok(())
+                } => v
+            }
+        });
+
+        let thread_cancel = cancel.clone();
+        rx_thread.spawn(async move {
+            tokio::select! {
+                _ = thread_cancel.cancelled() => Result::Ok(()),
+                v = async {
+                    loop {
+                        if let n @ Err(_) = poller.run().await {
+                            trace!("Polling has ended");
+                            return n;
+                        }
+                    }
+                }=> v
             }
         });
 
@@ -77,6 +113,7 @@ impl BcConnection {
             sink: sinker,
             poll_commander,
             rx_thread: RwLock::new(rx_thread),
+            cancel,
         })
     }
 
@@ -147,6 +184,29 @@ impl BcConnection {
         }
         Ok(())
     }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        let _ = self.poll_commander.send(PollCommand::Disconnect).await;
+        log::debug!("BcConnection::shutdown Cancel");
+        self.cancel.cancel();
+        let mut locked_threads = self.rx_thread.write().await;
+        while locked_threads.join_next().await.is_some() {}
+        Ok(())
+    }
+}
+
+impl Drop for BcConnection {
+    fn drop(&mut self) {
+        log::trace!("Drop BcConnection");
+        self.cancel.cancel();
+        tokio::task::block_in_place(move || {
+            let _ = tokio::runtime::Handle::current().block_on(async move {
+                let _ = self.shutdown().await;
+                Result::Ok(())
+            });
+        });
+        log::trace!("Dropped BcConnection");
+    }
 }
 
 enum PollCommand {
@@ -154,6 +214,19 @@ enum PollCommand {
     AddHandler(u32, Arc<MsgHandler>),
     RemoveHandler(u32),
     AddSubscriber(u32, Option<u16>, Sender<Result<Bc>>),
+    Disconnect,
+}
+
+impl std::fmt::Debug for PollCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PollCommand::Bc(_) => f.write_str("PollCommand::Bc"),
+            PollCommand::AddHandler(_, _) => f.write_str("PollCommand::AddHandler"),
+            PollCommand::RemoveHandler(_) => f.write_str("PollCommand::RemoveHandler"),
+            PollCommand::AddSubscriber(_, _, _) => f.write_str("PollCommand::AddSubscriber"),
+            PollCommand::Disconnect => f.write_str("PollCommand::Disconnect"),
+        }
+    }
 }
 
 struct Poller {
@@ -166,22 +239,43 @@ impl Poller {
     async fn run(&mut self) -> Result<()> {
         while let Some(command) = self.reciever.next().await {
             yield_now().await;
+            // Clean Up subscribers
+            self.subscribers
+                .num
+                .iter_mut()
+                .for_each(|(_, channels)| channels.retain(|_, channel| !channel.is_closed()));
+            self.subscribers
+                .num
+                .retain(|_, channels| !channels.is_empty());
+            // Handle the command
             match command {
                 PollCommand::Bc(boxed_response) => {
                     match *boxed_response {
                         Ok(response) => {
-                            let msg_num = response.meta.msg_num;
                             let msg_id = response.meta.msg_id;
-
+                            let msg_num = response.meta.msg_num;
+                            log::trace!(
+                                "Looking for ID: {} with num: {}, in {:?} and {:?}",
+                                msg_id,
+                                msg_num,
+                                self.subscribers.id.keys().to_owned(),
+                                self.subscribers
+                                    .num
+                                    .iter()
+                                    .map(|(k, v)| (k, v.keys()))
+                                    .collect::<Vec<_>>(),
+                            );
                             match (
                                 self.subscribers.id.get(&msg_id),
-                                self.subscribers.num.get_mut(&msg_id),
+                                self.subscribers.num.get_mut(&msg_id), // Both filter first on ID
                             ) {
                                 (Some(occ), _) => {
+                                    log::trace!("Calling ID callback");
                                     if let Some(reply) = occ(&response).await {
                                         assert!(reply.meta.msg_num == response.meta.msg_num);
                                         self.sink.send(Ok(reply)).await?;
                                     }
+                                    log::trace!("Called ID callback");
                                 }
                                 (None, Some(occ)) => {
                                     let sender = if let Some(sender) =
@@ -285,12 +379,16 @@ impl Poller {
                             if occ_entry.get().is_closed() {
                                 occ_entry.insert(tx);
                             } else {
+                                // log::error!("Failed to subscribe in bcconn to {:?} for {:?}", msg_num, msg_id);
                                 let _ = tx
                                     .send(Err(Error::SimultaneousSubscription { msg_num }))
                                     .await;
                             }
                         }
                     };
+                }
+                PollCommand::Disconnect => {
+                    return Err(Error::DroppedConnection);
                 }
             }
         }

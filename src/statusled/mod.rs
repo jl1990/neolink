@@ -19,19 +19,26 @@ use anyhow::{Context, Result};
 
 mod cmdline;
 
-use super::config::Config;
-use crate::utils::find_and_connect;
+use crate::common::NeoReactor;
 pub(crate) use cmdline::Opt;
 
 /// Entry point for the ledstatus subcommand
 ///
 /// Opt is the command line options
-pub(crate) async fn main(opt: Opt, config: Config) -> Result<()> {
-    let camera = find_and_connect(&config, &opt.camera).await?;
+pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
+    let camera = reactor.get(&opt.camera).await?;
 
+    let on = opt.on;
     camera
-        .led_light_set(opt.on)
-        .await
-        .context("Unable to set camera light state")?;
+        .run_task(|camera| {
+            Box::pin(async move {
+                camera
+                    .led_light_set(on)
+                    .await
+                    .context("Unable to set camera light state")
+            })
+        })
+        .await?;
+
     Ok(())
 }

@@ -29,7 +29,9 @@ use log::*;
 use std::fs;
 use validator::Validate;
 
+mod battery;
 mod cmdline;
+mod common;
 mod config;
 mod image;
 mod mqtt;
@@ -42,8 +44,10 @@ mod talk;
 mod utils;
 
 use cmdline::{Command, Opt};
+use common::NeoReactor;
 use config::Config;
 use console_subscriber as _;
+pub(crate) type AnyResult<T> = Result<T, anyhow::Error>;
 
 #[cfg(tokio_unstable)]
 fn tokio_console_enable() {
@@ -83,37 +87,48 @@ async fn main() -> Result<()> {
         tokio_console_enable();
     }
 
+    let neo_reactor = NeoReactor::new(config.clone()).await;
+
     match opt.cmd {
         None => {
             warn!(
                 "Deprecated command line option. Please use: `neolink rtsp --config={:?}`",
                 config
             );
-            rtsp::main(rtsp::Opt {}, config).await?;
+            rtsp::main(rtsp::Opt {}, neo_reactor.clone()).await?;
         }
         Some(Command::Rtsp(opts)) => {
-            rtsp::main(opts, config).await?;
+            rtsp::main(opts, neo_reactor.clone()).await?;
         }
         Some(Command::StatusLight(opts)) => {
-            statusled::main(opts, config).await?;
+            statusled::main(opts, neo_reactor.clone()).await?;
         }
         Some(Command::Reboot(opts)) => {
-            reboot::main(opts, config).await?;
+            reboot::main(opts, neo_reactor.clone()).await?;
         }
         Some(Command::Pir(opts)) => {
-            pir::main(opts, config).await?;
+            pir::main(opts, neo_reactor.clone()).await?;
         }
         Some(Command::Ptz(opts)) => {
-            ptz::main(opts, config).await?;
+            ptz::main(opts, neo_reactor.clone()).await?;
         }
         Some(Command::Talk(opts)) => {
-            talk::main(opts, config).await?;
+            talk::main(opts, neo_reactor.clone()).await?;
         }
         Some(Command::Mqtt(opts)) => {
-            mqtt::main(opts, config).await?;
+            mqtt::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::MqttRtsp(opts)) => {
+            tokio::select! {
+                v = mqtt::main(opts, neo_reactor.clone()) => v,
+                v = rtsp::main(rtsp::Opt {}, neo_reactor.clone()) => v,
+            }?;
         }
         Some(Command::Image(opts)) => {
-            image::main(opts, config).await?;
+            image::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Battery(opts)) => {
+            battery::main(opts, neo_reactor.clone()).await?;
         }
     }
 

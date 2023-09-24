@@ -2,16 +2,16 @@ use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
 
 impl BcCamera {
-    /// Get the [LinkType] xml which contains the connection status of the camera
-    ///
-    /// This is the same as `ping()` but with the return type
-    pub async fn get_linktype(&self) -> Result<LinkType> {
+    /// Get the [StreamInfoList] xml which contains the supported camera streams
+    pub async fn get_stream_info(&self) -> Result<StreamInfoList> {
         let connection = self.get_connection();
         let msg_num = self.new_message_num();
-        let mut sub_get = connection.subscribe(MSG_ID_PING, msg_num).await?;
+        let mut sub_get = connection
+            .subscribe(MSG_ID_STREAM_INFO_LIST, msg_num)
+            .await?;
         let get = Bc {
             meta: BcMeta {
-                msg_id: MSG_ID_PING,
+                msg_id: MSG_ID_STREAM_INFO_LIST,
                 channel_id: self.channel_id,
                 msg_num,
                 response_code: 0,
@@ -33,17 +33,17 @@ impl BcCamera {
         if let BcBody::ModernMsg(ModernMsg {
             payload:
                 Some(BcPayloads::BcXml(BcXml {
-                    link_type: Some(link_type),
+                    stream_info_list: Some(data),
                     ..
                 })),
             ..
         }) = msg.body
         {
-            Ok(link_type)
+            Ok(data)
         } else {
             Err(Error::UnintelligibleReply {
                 reply: std::sync::Arc::new(Box::new(msg)),
-                why: "Expected LinkType xml but it was not recieved",
+                why: "Expected StreamInfoList xml but it was not recieved",
             })
         }
     }

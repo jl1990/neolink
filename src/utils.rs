@@ -2,7 +2,7 @@
 //!
 use log::*;
 
-use super::config::{CameraConfig, Config};
+use super::config::CameraConfig;
 use anyhow::{anyhow, Context, Error, Result};
 use neolink_core::bc_protocol::{
     BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods, MaxEncryption,
@@ -17,7 +17,7 @@ pub(crate) fn timeout<F>(future: F) -> tokio::time::Timeout<F>
 where
     F: std::future::Future,
 {
-    tokio::time::timeout(tokio::time::Duration::from_secs(5), future)
+    tokio::time::timeout(tokio::time::Duration::from_secs(15), future)
 }
 
 pub(crate) enum AddressOrUid {
@@ -93,22 +93,18 @@ impl AddressOrUid {
             uid: camera_config.camera_uid.clone(),
             protocol: ConnectionProtocol::TcpUdp,
             discovery: camera_config.discovery,
-            aux_printing: camera_config.print_format,
             credentials: Credentials {
                 username: camera_config.username.clone(),
                 password: camera_config.password.clone(),
             },
+            debug: camera_config.debug,
+            max_discovery_retries: camera_config.max_discovery_retries,
         };
 
         trace!("Camera Info: {:?}", options);
 
         Ok(BcCamera::new(&options).await?)
     }
-}
-
-pub(crate) async fn find_and_connect(config: &Config, name: &str) -> Result<BcCamera> {
-    let camera_config = find_camera_by_name(config, name)?;
-    connect_and_login(camera_config).await
 }
 
 pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<BcCamera> {
@@ -147,12 +143,4 @@ pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<Bc
     info!("{}: Connected and logged in", camera_config.name);
 
     Ok(camera)
-}
-
-pub(crate) fn find_camera_by_name<'a>(config: &'a Config, name: &str) -> Result<&'a CameraConfig> {
-    config
-        .cameras
-        .iter()
-        .find(|c| c.name == name)
-        .ok_or_else(|| anyhow!("Camera {} not found in the config file", name))
 }

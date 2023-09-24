@@ -1,23 +1,21 @@
 use crate::mqtt::Discoveries;
 use lazy_static::lazy_static;
-use neolink_core::bc_protocol::{DiscoveryMethods, PrintFormat};
+use neolink_core::bc_protocol::{DiscoveryMethods, PrintFormat, StreamKind};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::clone::Clone;
 use std::collections::HashSet;
 use validator::{Validate, ValidationError};
 use validator_derive::Validate;
 
 lazy_static! {
-    static ref RE_STREAM_SRC: Regex =
-        Regex::new(r"^(mainStream|subStream|externStream|both|all)$").unwrap();
     static ref RE_TLS_CLIENT_AUTH: Regex = Regex::new(r"^(none|request|require)$").unwrap();
     static ref RE_PAUSE_MODE: Regex = Regex::new(r"^(black|still|test|none)$").unwrap();
     static ref RE_MAXENC_SRC: Regex =
         Regex::new(r"^([nN]one|[Aa][Ee][Ss]|[Bb][Cc][Ee][Nn][Cc][Rr][Yy][Pp][Tt])$").unwrap();
 }
 
-#[derive(Debug, Deserialize, Validate, Clone)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
 pub(crate) struct Config {
     #[validate]
     pub(crate) cameras: Vec<CameraConfig>,
@@ -35,6 +33,9 @@ pub(crate) struct Config {
     #[serde(default = "default_certificate")]
     pub(crate) certificate: Option<String>,
 
+    #[serde(default = "Default::default")]
+    pub(crate) mqtt: Option<MqttServerConfig>,
+
     #[validate(regex(
         path = "RE_TLS_CLIENT_AUTH",
         message = "Incorrect tls auth",
@@ -48,7 +49,81 @@ pub(crate) struct Config {
     pub(crate) users: Vec<UserConfig>,
 }
 
-#[derive(Debug, Deserialize, Validate, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
+#[validate(schema(function = "validate_mqtt_server", skip_on_field_errors = true))]
+pub(crate) struct MqttServerConfig {
+    #[serde(alias = "server")]
+    pub(crate) broker_addr: String,
+
+    pub(crate) port: u16,
+
+    #[serde(default)]
+    pub(crate) credentials: Option<(String, String)>,
+
+    #[serde(default)]
+    pub(crate) ca: Option<std::path::PathBuf>,
+
+    #[serde(default)]
+    pub(crate) client_auth: Option<(std::path::PathBuf, std::path::PathBuf)>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum StreamConfig {
+    #[serde(alias = "none")]
+    None,
+    #[serde(alias = "all")]
+    All,
+    #[serde(alias = "both")]
+    Both,
+    #[serde(
+        alias = "main",
+        alias = "mainStream",
+        alias = "mainstream",
+        alias = "MainStream"
+    )]
+    Main,
+    #[serde(
+        alias = "sub",
+        alias = "subStream",
+        alias = "substream",
+        alias = "SubStream"
+    )]
+    Sub,
+    #[serde(
+        alias = "extern",
+        alias = "externStream",
+        alias = "externstream",
+        alias = "ExternStream"
+    )]
+    Extern,
+}
+
+impl StreamConfig {
+    pub(crate) fn as_stream_kinds(&self) -> Vec<StreamKind> {
+        match self {
+            StreamConfig::All => {
+                vec![StreamKind::Main, StreamKind::Extern, StreamKind::Sub]
+            }
+            StreamConfig::Both => {
+                vec![StreamKind::Main, StreamKind::Sub]
+            }
+            StreamConfig::Main => {
+                vec![StreamKind::Main]
+            }
+            StreamConfig::Sub => {
+                vec![StreamKind::Sub]
+            }
+            StreamConfig::Extern => {
+                vec![StreamKind::Extern]
+            }
+            StreamConfig::None => {
+                vec![]
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
 #[validate(schema(function = "validate_camera_config"))]
 pub(crate) struct CameraConfig {
     pub(crate) name: String,
@@ -62,13 +137,8 @@ pub(crate) struct CameraConfig {
     pub(crate) username: String,
     pub(crate) password: Option<String>,
 
-    #[validate(regex(
-        path = "RE_STREAM_SRC",
-        message = "Incorrect stream source",
-        code = "stream"
-    ))]
     #[serde(default = "default_stream")]
-    pub(crate) stream: String,
+    pub(crate) stream: StreamConfig,
 
     pub(crate) permitted_users: Option<Vec<String>>,
 
@@ -78,7 +148,7 @@ pub(crate) struct CameraConfig {
 
     #[validate]
     #[serde(default = "default_mqtt")]
-    pub(crate) mqtt: Option<MqttConfig>,
+    pub(crate) mqtt: MqttConfig,
 
     #[validate]
     #[serde(default = "default_pause")]
@@ -114,15 +184,21 @@ pub(crate) struct CameraConfig {
     #[serde(default = "default_buffer_size", alias = "size", alias = "buffer")]
     pub(crate) buffer_size: usize,
 
+    #[serde(default = "default_true", alias = "enable")]
+    pub(crate) enabled: bool,
+
+    #[serde(default = "default_false", alias = "verbose")]
+    pub(crate) debug: bool,
+
     #[serde(
-        default = "default_smoothing",
-        alias = "smoothing",
-        alias = "stretching"
+        default = "default_max_discovery_retries",
+        alias = "retries",
+        alias = "max_retries"
     )]
-    pub(crate) use_smoothing: bool,
+    pub(crate) max_discovery_retries: usize,
 }
 
-#[derive(Debug, Deserialize, Validate, Clone)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct UserConfig {
     #[validate(custom = "validate_username")]
     #[serde(alias = "username")]
@@ -132,23 +208,8 @@ pub(crate) struct UserConfig {
     pub(crate) pass: String,
 }
 
-#[derive(Debug, Deserialize, Clone, Validate)]
-#[validate(schema(function = "validate_mqtt_config", skip_on_field_errors = true))]
+#[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
 pub(crate) struct MqttConfig {
-    #[serde(alias = "server")]
-    pub(crate) broker_addr: String,
-
-    pub(crate) port: u16,
-
-    #[serde(default)]
-    pub(crate) credentials: Option<(String, String)>,
-
-    #[serde(default)]
-    pub(crate) ca: Option<std::path::PathBuf>,
-
-    #[serde(default)]
-    pub(crate) client_auth: Option<(std::path::PathBuf, std::path::PathBuf)>,
-
     #[serde(default = "default_true")]
     pub(crate) enable_motion: bool,
     #[serde(default = "default_true")]
@@ -157,21 +218,37 @@ pub(crate) struct MqttConfig {
     pub(crate) enable_light: bool,
     #[serde(default = "default_true")]
     pub(crate) enable_battery: bool,
+    /// Update time in ms
+    #[serde(default = "default_2000")]
+    #[validate(range(
+        min = 500,
+        message = "Update ms should be > 500",
+        code = "battery_update"
+    ))]
+    pub(crate) battery_update: u64,
     #[serde(default = "default_true")]
     pub(crate) enable_preview: bool,
+    /// Update time in ms
+    #[validate(range(
+        min = 500,
+        message = "Update ms should be > 500",
+        code = "preview_update"
+    ))]
+    #[serde(default = "default_2000")]
+    pub(crate) preview_update: u64,
 
     #[serde(default)]
     pub(crate) discovery: Option<MqttDiscoveryConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone, Validate)]
+#[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
 pub(crate) struct MqttDiscoveryConfig {
     pub(crate) topic: String,
 
     pub(crate) features: HashSet<Discoveries>,
 }
 
-fn validate_mqtt_config(config: &MqttConfig) -> Result<(), ValidationError> {
+fn validate_mqtt_server(config: &MqttServerConfig) -> Result<(), ValidationError> {
     if config.ca.is_some() && config.client_auth.is_some() {
         Err(ValidationError::new(
             "Cannot have both ca and client_auth set",
@@ -185,8 +262,21 @@ const fn default_true() -> bool {
     true
 }
 
-fn default_mqtt() -> Option<MqttConfig> {
-    None
+const fn default_false() -> bool {
+    false
+}
+
+fn default_mqtt() -> MqttConfig {
+    MqttConfig {
+        enable_pings: true,
+        enable_motion: true,
+        enable_light: true,
+        enable_battery: true,
+        battery_update: 2000,
+        enable_preview: true,
+        preview_update: 2000,
+        discovery: Default::default(),
+    }
 }
 
 fn default_print() -> PrintFormat {
@@ -201,7 +291,7 @@ fn default_maxenc() -> String {
     "Aes".to_string()
 }
 
-#[derive(Debug, Deserialize, Validate, Clone)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
 pub(crate) struct PauseConfig {
     #[serde(default = "default_on_motion")]
     pub(crate) on_motion: bool,
@@ -229,8 +319,8 @@ fn default_bind_port() -> u16 {
     8554
 }
 
-fn default_stream() -> String {
-    "both".to_string()
+fn default_stream() -> StreamConfig {
+    StreamConfig::All
 }
 
 fn default_certificate() -> Option<String> {
@@ -282,12 +372,16 @@ fn default_pause() -> PauseConfig {
     }
 }
 
-fn default_smoothing() -> bool {
-    true
-}
-
 fn default_buffer_size() -> usize {
     25
+}
+
+fn default_max_discovery_retries() -> usize {
+    10
+}
+
+fn default_2000() -> u64 {
+    2000
 }
 
 pub(crate) static RESERVED_NAMES: &[&str] = &["anyone", "anonymous"];

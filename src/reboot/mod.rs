@@ -15,19 +15,25 @@ use anyhow::{Context, Result};
 
 mod cmdline;
 
-use super::config::Config;
-use crate::utils::find_and_connect;
+use crate::common::NeoReactor;
 pub(crate) use cmdline::Opt;
 
 /// Entry point for the reboot subcommand
 ///
 /// Opt is the command line options
-pub(crate) async fn main(opt: Opt, config: Config) -> Result<()> {
-    let camera = find_and_connect(&config, &opt.camera).await?;
+pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
+    let camera = reactor.get(&opt.camera).await?;
 
     camera
-        .reboot()
-        .await
-        .context("Could not send reboot command to the camera")?;
+        .run_task(|camera| {
+            Box::pin(async move {
+                camera
+                    .reboot()
+                    .await
+                    .context("Could not send reboot command to the camera")
+            })
+        })
+        .await?;
+
     Ok(())
 }

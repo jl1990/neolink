@@ -1,7 +1,7 @@
 [package]
 name = "neolink_core"
 description = "Core services and structure for Reolink IP cameras"
-version = "0.5.13"
+version = "0.6.1"
 authors = ["George Hilliard <thirtythreeforty@gmail.com>", "Andrew King <sheepchaan@gmail.com>"]
 edition = "2018"
 license = "AGPL-3.0-or-later"
@@ -13,7 +13,7 @@ cfb-mode = "0.8.2"
 cookie-factory = "0.3.2"
 crc32fast = "1.3.2"
 crossbeam-channel = "0.5.8"
-delegate = "0.9.0"
+delegate = "0.10.0"
 err-derive = "0.3.1"
 futures = "0.3.28"
 get_if_addrs = "0.5.3"

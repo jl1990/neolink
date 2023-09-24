@@ -4,12 +4,9 @@ use crate::{
     bcmedia::model::*,
 };
 use futures::stream::StreamExt;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio::task::{self, JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 /// The stream names supported by BC
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -25,6 +22,16 @@ pub enum StreamKind {
     Extern,
 }
 
+impl std::fmt::Display for StreamKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            StreamKind::Main => write!(f, "mainStream"),
+            StreamKind::Sub => write!(f, "subStream"),
+            StreamKind::Extern => write!(f, "externStream"),
+        }
+    }
+}
+
 /// A handle on currently streaming data
 ///
 /// The data can be pulled using `get_data` which returns raw BcMedia packets
@@ -33,7 +40,7 @@ pub enum StreamKind {
 pub struct StreamData {
     handle: Option<JoinHandle<Result<()>>>,
     rx: Receiver<Result<BcMedia>>,
-    abort_handle: Arc<AtomicBool>,
+    abort_handle: CancellationToken,
 }
 
 impl StreamData {
@@ -42,12 +49,14 @@ impl StreamData {
     pub async fn get_data(&mut self) -> Result<Result<BcMedia>> {
         if let Some(handle) = self.handle.as_mut() {
             if handle.is_finished() {
-                self.abort_handle.store(true, Ordering::Relaxed);
+                log::debug!("SteamData::get_data Cancel1");
+                self.abort_handle.cancel();
                 handle.await??;
                 return Err(Error::DroppedConnection);
             }
         } else {
-            self.abort_handle.store(true, Ordering::Relaxed);
+            log::debug!("SteamData::get_data Cancel2");
+            self.abort_handle.cancel();
             return Err(Error::DroppedConnection);
         }
         // debug!("StreamData: Get");
@@ -58,16 +67,34 @@ impl StreamData {
             }
             None => {
                 // debug!("StreamData: Drop");
-                self.abort_handle.store(true, Ordering::Relaxed);
+                log::debug!("SteamData::get_data Cancel3");
+                self.abort_handle.cancel();
                 Err(Error::DroppedConnection)
             }
         }
+    }
+
+    /// Attempts to gracefully shutdown this will cancel the background task and send
+    /// the Stop command to the camera
+    pub async fn shutdown(&mut self) -> Result<()> {
+        log::debug!("SteamData::shutdown Cancel");
+        self.abort_handle.cancel();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for StreamData {
     fn drop(&mut self) {
-        self.abort_handle.store(true, Ordering::Relaxed);
+        log::trace!("Drop StreamData");
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let _ = self.shutdown().await;
+            });
+        });
+        log::trace!("Dropped MotionData");
     }
 }
 
@@ -100,7 +127,7 @@ impl BcCamera {
         let connection = self.get_connection();
         let msg_num = self.new_message_num();
 
-        let abort_handle = Arc::new(AtomicBool::new(false));
+        let abort_handle = CancellationToken::new();
         let abort_handle_thread = abort_handle.clone();
 
         if buffer_size == 0 {
@@ -110,7 +137,6 @@ impl BcCamera {
         let channel_id = self.channel_id;
 
         let handle = task::spawn(async move {
-            tokio::task::yield_now().await;
             let mut sub_video = connection.subscribe(MSG_ID_VIDEO, msg_num).await?;
 
             // On an E1 and swann cameras:
@@ -186,20 +212,20 @@ impl BcCamera {
             {
                 let mut media_sub = sub_video.bcmedia_stream(strict);
 
-                while !abort_handle_thread.load(Ordering::Relaxed) {
-                    // debug!("Stream: Get");
-                    if let Some(bc_media) = media_sub.next().await {
-                        // debug!("Stream: Got");
-                        // We now have a complete interesting packet. Send it to on the callback
-                        // debug!("Stream: Send");
-                        if tx.send(bc_media).await.is_err() {
-                            // debug!("Stream: Dropped");
-                            break; // Connection dropped
+                tokio::select! {
+                    _ = abort_handle_thread.cancelled() => {},
+                    _ = async {
+                        while let Some(bc_media) = media_sub.next().await {
+                            // debug!("Stream: Got");
+                            // We now have a complete interesting packet. Send it to on the callback
+                            // debug!("Stream: Send");
+                            if tx.send(bc_media).await.is_err() {
+                                // debug!("Stream: Dropped");
+                                break; // Connection dropped
+                            }
+                            // debug!("Stream: Sent");
                         }
-                        // debug!("Stream: Sent");
-                    } else {
-                        break;
-                    }
+                    } => {}
                 }
             }
 

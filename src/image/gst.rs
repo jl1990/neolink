@@ -3,30 +3,32 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{parse_launch, prelude::*, ClockTime, MessageView, Pipeline, State};
 use gstreamer_app::AppSrc;
-use neolink_core::bcmedia::model::VideoType;
 use tokio::{
     sync::{
         self,
         mpsc::{channel, Sender},
     },
-    task::{self, JoinSet},
+    task::JoinSet,
 };
+use tokio_util::sync::CancellationToken;
+
+use crate::{common::VidFormat, AnyResult};
 
 #[derive(Debug)]
 enum GstControl {
-    Data(Vec<u8>),
+    Data(std::sync::Arc<Vec<u8>>),
     Eos,
 }
 
 pub(super) struct GstSender {
     sender: Sender<GstControl>,
-    #[allow(dead_code)] // It is used for its automatic drop
     set: JoinSet<Result<()>>,
     finished: sync::oneshot::Receiver<Result<()>>,
+    cancel: CancellationToken,
 }
 
 impl GstSender {
-    pub(super) async fn send(&self, buf: Vec<u8>) -> Result<()> {
+    pub(super) async fn send(&self, buf: std::sync::Arc<Vec<u8>>) -> Result<()> {
         self.sender
             .send(GstControl::Data(buf))
             .await
@@ -49,10 +51,29 @@ impl GstSender {
             }
         }
     }
+
+    pub(super) async fn join(mut self) -> Result<()> {
+        while self.set.join_next().await.is_some() {}
+        Ok(())
+    }
+}
+
+impl Drop for GstSender {
+    fn drop(&mut self) {
+        log::trace!("Drop GstSender");
+        self.cancel.cancel();
+        tokio::task::block_in_place(move || {
+            let _ = tokio::runtime::Handle::current().block_on(async move {
+                while self.set.join_next().await.is_some() {}
+                AnyResult::Ok(())
+            });
+        });
+        log::trace!("Dropped GstSender");
+    }
 }
 
 pub(super) async fn from_input<T: AsRef<Path>>(
-    format: VideoType,
+    format: VidFormat,
     out_file: T,
 ) -> Result<GstSender> {
     let pipeline = create_pipeline(format, out_file.as_ref())?;
@@ -62,42 +83,51 @@ pub(super) async fn from_input<T: AsRef<Path>>(
 async fn output(pipeline: Pipeline) -> Result<GstSender> {
     let source = get_source(&pipeline)?;
     let (sender, mut reciever) = channel::<GstControl>(100);
-    let mut set = JoinSet::new();
+    let mut set = JoinSet::<AnyResult<()>>::new();
+    let cancel = CancellationToken::new();
+    let thread_cancel = cancel.clone();
     set.spawn(async move {
-        while let Some(control) = reciever.recv().await {
-            tokio::task::yield_now().await;
-            match control {
-                GstControl::Data(buf) => {
-                    let mut gst_buf = gstreamer::Buffer::with_size(buf.len()).unwrap();
-                    {
-                        let gst_buf_mut = gst_buf.get_mut().unwrap();
-                        let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
-                        gst_buf_data.copy_from_slice(&buf);
+        tokio::select!{
+            _ = thread_cancel.cancelled() => Result::Ok(()),
+            v = async {
+                while let Some(control) = reciever.recv().await {
+                    tokio::task::yield_now().await;
+                    match control {
+                        GstControl::Data(buf) => {
+                            let mut gst_buf = gstreamer::Buffer::with_size(buf.len()).unwrap();
+                            {
+                                let gst_buf_mut = gst_buf.get_mut().unwrap();
+                                let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
+                                gst_buf_data.copy_from_slice(&buf);
+                            }
+                            source.push_buffer(gst_buf).map_err(|e| anyhow!("Streamer Error: {e:?}"))?;
+                        }
+                        GstControl::Eos => {
+                            source.end_of_stream().map_err(|e| anyhow!("Streamer Error: {e:?}"))?;
+                            break;
+                        }
                     }
-                    source.push_buffer(gst_buf)?;
                 }
-                GstControl::Eos => {
-                    source.end_of_stream()?;
-                    break;
-                }
-            }
+                Ok(())
+            } => v,
         }
-        Ok(())
     });
 
     let (tx, finished) = sync::oneshot::channel();
-    task::spawn_blocking(move || {
+    set.spawn_blocking(move || {
         let res = start_pipeline(pipeline);
         if let Err(e) = &res {
             log::error!("Failed to run pipeline: {:?}", e);
         }
-        tx.send(res)
+        let _ = tx.send(res);
+        Ok(())
     });
 
     Ok(GstSender {
         sender,
         set,
         finished,
+        cancel,
     })
 }
 
@@ -140,13 +170,13 @@ fn get_source(pipeline: &Pipeline) -> Result<AppSrc> {
         .map_err(|_| anyhow!("Cannot find appsource in gstreamer, check your gstreamer plugins"))
 }
 
-fn create_pipeline(format: VideoType, file_path: &Path) -> Result<Pipeline> {
+fn create_pipeline(format: VidFormat, file_path: &Path) -> Result<Pipeline> {
     gstreamer::init()
         .context("Unable to start gstreamer ensure it and all plugins are installed")?;
     let file_path = file_path.with_extension("jpeg");
 
     let launch_str = match format {
-        VideoType::H264 => {
+        VidFormat::H264 => {
             format!(
                 "appsrc name=thesource \
                 ! h264parse \
@@ -156,7 +186,7 @@ fn create_pipeline(format: VideoType, file_path: &Path) -> Result<Pipeline> {
                 file_path.display()
             )
         }
-        VideoType::H265 => {
+        VidFormat::H265 => {
             format!(
                 "appsrc name=thesource \
                 ! h265parse \
@@ -166,6 +196,7 @@ fn create_pipeline(format: VideoType, file_path: &Path) -> Result<Pipeline> {
                 file_path.display()
             )
         }
+        VidFormat::None => unreachable!(),
     };
 
     log::info!("{}", launch_str);

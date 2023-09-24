@@ -8,6 +8,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU16, Ordering},
 };
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use Md5Trunc::*;
 
@@ -19,6 +20,7 @@ mod errors;
 mod floodlight_status;
 mod keepalive;
 mod ledstate;
+mod link;
 mod login;
 mod logout;
 mod motion;
@@ -30,6 +32,7 @@ mod reboot;
 mod resolution;
 mod snap;
 mod stream;
+mod stream_info;
 mod talk;
 mod time;
 mod version;
@@ -67,6 +70,8 @@ pub struct BcCamera {
     // Certain commands such as logout require the username/pass in plain text.... why....???
     credentials: Credentials,
     abilities: RwLock<HashMap<String, ReadKind>>,
+    #[allow(dead_code)]
+    cancel: CancellationToken,
 }
 
 /// Options used to construct a camera
@@ -87,17 +92,19 @@ pub struct BcCameraOpt {
     pub protocol: ConnectionProtocol,
     /// Discovery method to allow
     pub discovery: DiscoveryMethods,
-    /// Printing format for auxilaary data such as battery levels
-    pub aux_printing: PrintFormat,
+    /// Maximum number of retries for discovery
+    pub max_discovery_retries: usize,
     /// Credentials for login
     pub credentials: Credentials,
+    /// Toggle debug print of underlying data
+    pub debug: bool,
 }
 
 /// Used to choose the print format of various status messages like battery levels
 ///
 /// Currently this is just the format of battery levels but if we ever got more status
 /// messages then they will also use this information
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PrintFormat {
     /// None, don't print
     None,
@@ -128,6 +135,7 @@ impl BcCamera {
     /// Try to connect to the camera via appropaite methods and return
     /// the location that should be used
     async fn find_camera(options: &BcCameraOpt) -> Result<CameraLocation> {
+        let discovery = Discovery::new().await?;
         if let ConnectionProtocol::Tcp | ConnectionProtocol::TcpUdp = options.protocol {
             let mut sockets = vec![];
             match options.port {
@@ -147,7 +155,7 @@ impl BcCamera {
                 info!("{}: Trying TCP discovery", options.name);
                 for socket in sockets.drain(..) {
                     let channel_id: u8 = options.channel_id;
-                    if let Ok(addr) = Discovery::check_tcp(socket, channel_id).await.map(|_| {
+                    if let Ok(addr) = discovery.check_tcp(socket, channel_id).await.map(|_| {
                         info!("{}: TCP Discovery success at {:?}", options.name, &socket);
                         socket
                     }) {
@@ -186,62 +194,114 @@ impl BcCamera {
                 DiscoveryMethods::Debug => (false, false, false, true),
             };
 
-            if allow_local {
-                let uid_local = uid.clone();
-                info!("{}: Trying local discovery", options.name);
-                let result = Discovery::local(&uid_local, Some(sockets)).await;
-                if let Ok(disc) = result {
-                    info!(
-                        "{}: Local discovery success {} at {}",
-                        options.name,
-                        uid_local,
-                        disc.get_addr()
-                    );
-                    return Ok(CameraLocation::Udp(disc));
-                }
-            }
-            if allow_remote {
-                let uid_remote = uid.clone();
-                info!("{}: Trying remote discovery", options.name);
-                let result = Discovery::remote(&uid_remote).await;
-                if let Ok(disc) = result {
-                    info!(
-                        "{}: Remote discovery success {} at {}",
-                        options.name,
-                        uid_remote,
-                        disc.get_addr()
-                    );
-                    return Ok(CameraLocation::Udp(disc));
-                }
-            }
-            if allow_map {
-                let uid_map = uid.clone();
-                info!("{}: Trying map discovery", options.name);
-                let result = Discovery::map(&uid_map).await;
-                if let Ok(disc) = result {
-                    info!(
-                        "{}: Map success {} at {}",
-                        options.name,
-                        uid_map,
-                        disc.get_addr()
-                    );
-                    return Ok(CameraLocation::Udp(disc));
-                }
-            }
-            if allow_relay {
-                let uid_relay = uid.clone();
-                info!("{}: Trying relay discovery", options.name);
-                let result = Discovery::relay(&uid_relay).await;
-                if let Ok(disc) = result {
-                    info!(
-                        "{}: Relay success {} at {}",
-                        options.name,
-                        uid_relay,
-                        disc.get_addr()
-                    );
-                    return Ok(CameraLocation::Udp(disc));
-                }
-            }
+            let res = tokio::select! {
+                Ok(v) = async {
+                    let uid_local = uid.clone();
+                    info!("{}: Trying local discovery", options.name);
+                    let result = discovery.local(&uid_local, Some(sockets)).await;
+                    match result {
+                        Ok(disc) => {
+                            info!(
+                                "{}: Local discovery success {} at {}",
+                                options.name,
+                                uid_local,
+                                disc.get_addr()
+                            );
+                            Ok(CameraLocation::Udp(disc))
+                        },
+                        Err(e) => Err(e)
+                    }
+                }, if allow_local => Ok(v),
+                Ok(v) = async {
+                    let mut discovery = Discovery::new().await?;
+                    let reg_result;
+                    // Registration is looped as it seems that reolink
+                    // only updates the registration lazily when someone attempts
+                    // to connect. The first few connects fails until the server data
+                    // is updated
+                    //
+                    // We loop infinitly and allow the caller to timeout at the
+                    // interval they desire
+                    let mut retry = 0;
+                    let max_retry: usize = options.max_discovery_retries;
+                    loop {
+                        tokio::task::yield_now().await;
+                        if let Ok(result) = discovery.get_registration(uid).await {
+                            reg_result = result;
+                            break;
+                        }
+                        if retry >= max_retry && max_retry > 0 {
+                            return Err(Error::DiscoveryTimeout);
+                        }
+                        log::info!("{}: Registration with reolink servers failed. Retrying: {}/{}", options.name, retry + 1, if max_retry > 0 {format!("{}", max_retry)} else {"infinite".to_string()});
+                        retry += 1;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        // New discovery to get new client IDs
+                        discovery = Discovery::new().await?;
+                    };
+                    tokio::select! {
+                        Ok(v) = async {
+                            let uid_remote = uid.clone();
+                            info!("{}: Trying remote discovery", options.name);
+                            let result = discovery
+                                .remote(&uid_remote, &reg_result)
+                                .await;
+                            match result {
+                                Ok(disc) => {
+                                    info!(
+                                        "{}: Remote discovery success {} at {}",
+                                        options.name,
+                                        uid_remote,
+                                        disc.get_addr()
+                                    );
+                                    Ok(CameraLocation::Udp(disc))
+                                },
+                                Err(e) => Err(e)
+                            }
+                        }, if allow_remote => Ok(v),
+                        Ok(v) = async {
+                            let uid_map = uid.clone();
+                            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                            info!("{}: Trying map discovery", options.name);
+                            let result = discovery.map(&reg_result).await;
+                            match result {
+                                Ok(disc) => {
+                                    info!(
+                                        "{}: Map success {} at {}",
+                                        options.name,
+                                        uid_map,
+                                        disc.get_addr()
+                                    );
+                                    Ok(CameraLocation::Udp(disc))
+                                },
+                                Err(e) => Err(e),
+                            }
+                        }, if allow_map => Ok(v),
+                        Ok(v) = async {
+                            let uid_relay = uid.clone();
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            info!("{}: Trying relay discovery", options.name);
+                            let result = discovery.relay(&reg_result).await;
+                            match result {
+                                Ok(disc) => {
+                                    info!(
+                                        "{}: Relay success {} at {}",
+                                        options.name,
+                                        uid_relay,
+                                        disc.get_addr()
+                                    );
+                                    Ok(CameraLocation::Udp(disc))
+                                },
+                                Err(e) => Err(e),
+                            }
+                        }, if allow_relay => Ok(v),
+                        else => Err(Error::DiscoveryTimeout),
+                    }
+                }, if allow_remote || allow_map || allow_relay => Ok(v),
+                else => Err(Error::DiscoveryTimeout),
+            }?;
+
+            return Ok(res);
         }
 
         info!("{}: Discovery failed", options.name);
@@ -267,16 +327,20 @@ impl BcCamera {
         let (sink, source): (BcConnSink, BcConnSource) = {
             match BcCamera::find_camera(options).await? {
                 CameraLocation::Tcp(addr) => {
-                    let (x, r) = TcpSource::new(addr, &username, passwd.as_ref())
+                    let (x, r) = TcpSource::new(addr, &username, passwd.as_ref(), options.debug)
                         .await?
                         .split();
                     (Box::new(x), Box::new(r))
                 }
                 CameraLocation::Udp(discovery) => {
-                    let (x, r) =
-                        UdpSource::new_from_discovery(discovery, &username, passwd.as_ref())
-                            .await?
-                            .split();
+                    let (x, r) = UdpSource::new_from_discovery(
+                        discovery,
+                        &username,
+                        passwd.as_ref(),
+                        options.debug,
+                    )
+                    .await?
+                    .split();
                     (Box::new(x), Box::new(r))
                 }
             }
@@ -292,11 +356,9 @@ impl BcCamera {
             logged_in: AtomicBool::new(false),
             credentials: Credentials::new(username, passwd),
             abilities: Default::default(),
+            cancel: CancellationToken::new(),
         };
         me.keepalive().await?;
-        if let Err(e) = me.monitor_battery(options.aux_printing).await {
-            warn!("Could not monitor battery: {:?}", e);
-        }
         Ok(me)
     }
 
@@ -357,6 +419,13 @@ impl BcCamera {
     /// If an error is returned in any thread it will return the first error
     pub async fn join(&self) -> Result<()> {
         self.connection.join().await
+    }
+
+    /// Disconnect from the camera. This is done by sending cancel to
+    /// all threads then waiting for the join
+    pub async fn shutdown(&self) -> Result<()> {
+        self.connection.shutdown().await?;
+        Ok(())
     }
 }
 

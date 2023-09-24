@@ -37,8 +37,12 @@ pub const MSG_ID_VERSION: u32 = 80;
 pub const MSG_ID_PING: u32 = 93;
 /// General system info messages have this ID
 pub const MSG_ID_GET_GENERAL: u32 = 104;
+/// Setting general system info (clock mostly) messages have this ID
+pub const MSG_ID_SET_GENERAL: u32 = 105;
 /// Snapshot to get a jpeg image
 pub const MSG_ID_SNAP: u32 = 109;
+/// StreamInfoList messages have this ID
+pub const MSG_ID_STREAM_INFO_LIST: u32 = 146;
 /// Used to get the abilities of a user
 pub const MSG_ID_ABILITY_INFO: u32 = 151;
 /// Setting general system info (clock mostly) messages have this ID
@@ -130,6 +134,8 @@ pub enum LegacyMsg {
         /// Password for a legacy login
         password: String,
     },
+    /// Sent to upgrade to modern and not exposed the MD5 username/password
+    LoginUpgrade,
     /// Any other type of legacy message will be collected here
     UnknownMsg,
 }
@@ -200,6 +206,9 @@ pub enum EncryptionProtocol {
     /// Latest cameras/firmwares use Aes with the key derived from
     /// the camera's password and the negotiated NONCE
     Aes([u8; 16]),
+    /// Same as Aes but the media stream is also encrypted and not just
+    /// the control commands
+    FullAes([u8; 16]),
 }
 
 #[derive(Debug)]
@@ -207,6 +216,7 @@ pub(crate) struct BcContext {
     pub(crate) credentials: Credentials,
     pub(crate) in_bin_mode: HashSet<u16>,
     pub(crate) encryption_protocol: EncryptionProtocol,
+    pub(crate) debug: bool,
 }
 
 impl Bc {
@@ -248,6 +258,7 @@ impl BcContext {
             credentials,
             in_bin_mode: HashSet::new(),
             encryption_protocol: EncryptionProtocol::Unencrypted,
+            debug: false,
         }
     }
 
@@ -257,6 +268,7 @@ impl BcContext {
             credentials: Default::default(),
             in_bin_mode: HashSet::new(),
             encryption_protocol,
+            debug: false,
         }
     }
 
@@ -275,6 +287,10 @@ impl BcContext {
     #[allow(unused)] // Used in tests
     pub(crate) fn binary_off(&mut self, msg_id: u16) {
         self.in_bin_mode.remove(&msg_id);
+    }
+
+    pub(crate) fn debug_on(&mut self) {
+        self.debug = true;
     }
 }
 

@@ -17,26 +17,35 @@ use anyhow::{Context, Result};
 
 mod cmdline;
 
-use super::config::Config;
-use crate::utils::find_and_connect;
+use crate::common::NeoReactor;
 pub(crate) use cmdline::Opt;
 
 /// Entry point for the pir subcommand
 ///
 /// Opt is the command line options
-pub(crate) async fn main(opt: Opt, config: Config) -> Result<()> {
-    let camera = find_and_connect(&config, &opt.camera).await?;
+pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
+    let camera = reactor.get(&opt.camera).await?;
 
     if let Some(on) = opt.on {
         camera
-            .pir_set(on)
-            .await
-            .context("Unable to set camera PIR state")?;
+            .run_task(|cam| {
+                Box::pin(async move {
+                    cam.pir_set(on)
+                        .await
+                        .context("Unable to set camera PIR state")
+                })
+            })
+            .await?;
     } else {
         let pir_state = camera
-            .get_pirstate()
-            .await
-            .context("Unable to get camera PIR state")?;
+            .run_task(|cam| {
+                Box::pin(async move {
+                    cam.get_pirstate()
+                        .await
+                        .context("Unable to get camera PIR state")
+                })
+            })
+            .await?;
         let pir_ser = String::from_utf8(
             yaserde::ser::serialize_with_writer(&pir_state, vec![], &Default::default())
                 .expect("Should Ser the struct"),
@@ -44,5 +53,6 @@ pub(crate) async fn main(opt: Opt, config: Config) -> Result<()> {
         .expect("Should be UTF8");
         println!("{}", pir_ser);
     }
+
     Ok(())
 }
